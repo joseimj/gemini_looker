@@ -1,92 +1,84 @@
 #!/bin/bash
 # =============================================================================
-#  looker_gemini_setup_v8.sh
-#  Agente Looker para Gemini Enterprise  ·  Autor: Jose Maldonado (@joseimj)
+#  gemini_looker.sh
+#  A Looker analytics agent for Google's Gemini Enterprise
+#  Author: Jose Maldonado (@joseimj)
 # =============================================================================
 #
-#  QUE HACE ESTE SCRIPT
-#  --------------------
-#  Despliega, de punta a punta e idempotentemente, un agente conversacional de
-#  Looker sobre Google Cloud y lo registra en Gemini Enterprise. Al terminar,
-#  un usuario puede pedir en lenguaje natural "muestrame el dashboard 1" o
-#  "cuantas ordenes hay por estado" y recibir la imagen del grafico (o la tabla
-#  de datos) + un link interactivo a Looker, dentro del chat de Gemini Enterprise.
+#  WHAT THIS PROJECT DOES (read this first)
+#  ----------------------------------------
+#  This single script stands up, end to end, a conversational analytics agent
+#  that lives inside Gemini Enterprise and talks to a Looker instance. A
+#  business user can ask, in plain language:
 #
-#  ARQUITECTURA (v8) - deliberadamente minima
-#  ------------------------------------------
-#    Gemini Enterprise (UI)
-#        -> Agent Engine (ADK LlmAgent + Looker SDK + artifacts + firma SSO)
-#            -> Looker API
+#      "show me the sales dashboard"   -> the agent renders it as an image
+#      "how many orders are complete?" -> the agent answers with the numbers
+#      "give me the link to look 9"    -> the agent returns a signed Looker URL
 #
-#  SIN Cloud Run, SIN Redis, SIN VPC, SIN MCP, SIN ID tokens. El agente habla
-#  con Looker directo via SDK usando las mismas credenciales por env var.
+#  The script is idempotent: it provisions the cloud resources, deploys the
+#  agent, and registers it in Gemini Enterprise. Run it again and it reuses
+#  what already exists instead of duplicating it.
 #
-#  POR QUE ESTA ARQUITECTURA (dos bugs que la v8 resuelve)
-#  -------------------------------------------------------
-#  BUG 1 - "las imagenes nunca renderizaban"
-#    Antes la imagen se devolvia como data URI base64 dentro de un campo
-#    "markdown" y se le pedia al LLM repetir esa cadena caracter por caracter.
-#    Es inviable:
-#      - un PNG real son cientos de KB -> base64 son cientos de miles de tokens,
-#        muy por encima del limite de salida del modelo (se trunca -> img rota)
-#      - los LLM no reproducen cadenas opacas largas de forma fiable
-#      - el frontend ademas suele bloquear img-src data: por CSP
-#    v8 usa ADK Artifacts: la tool guarda los bytes PNG con
-#    tool_context.save_artifact() y el agente llama a load_artifacts_tool. Los
-#    bytes NUNCA pasan por la salida de texto del LLM; el runtime de Agent
-#    Engine los renderiza nativamente en Gemini Enterprise.
+#  HOW IT WORKS (the end-to-end flow)
+#  ----------------------------------
+#      Gemini Enterprise (the chat UI the user sees)
+#          -> Vertex AI Agent Engine (the managed runtime that hosts the agent)
+#              -> the ADK agent (Python), which talks to Looker via its SDK
+#                  -> Looker (dashboards, Looks, explores, data)
 #
-#  BUG 2 - "a veces no respondia hasta el 2do o 3er intento"
-#    Antes el agente hablaba con un toolbox MCP en Cloud Run usando un ID token
-#    calculado UNA sola vez al construir el agente. Ese token caduca a ~1h, ADK
-#    no lo refresca, y cuando Cloud Run responde 401 ADK se cuelga hasta el
-#    timeout en vez de fallar limpio -> "no responde"; al reintentar caia en una
-#    instancia fria con token fresco -> funcionaba. v8 ELIMINA la capa MCP +
-#    Cloud Run: cero ID tokens, cero invoker IAM, cero cold-start, cero ese bug.
+#  Two design decisions worth calling out:
+#    1. Images are returned as ADK "artifacts", not as text/base64. The agent
+#       saves the rendered PNG and the runtime displays it natively. This is
+#       the only reliable way to show images inline in Gemini Enterprise.
+#    2. There is no intermediate service (no Cloud Run, no message broker, no
+#       caching tier). The agent calls Looker directly. Fewer moving parts
+#       means fewer ways to fail, and it keeps the deployment cheap and fast.
 #
-#  PASOS (en orden, idempotentes)
-#  ------------------------------
-#    -1 Validar variables      4 Service account + IAM minimo
-#     0 Autenticacion           5 Bucket staging/artifacts
-#     1 Habilitar APIs          6 App del agente (ADK)
-#     2 (ver paso 4)            7 Deploy a Agent Engine (~15-20 min)
-#     3 (ver paso 5)            8 Registro en Gemini Enterprise
+#  THE STEPS THIS SCRIPT RUNS
+#  --------------------------
+#    -1  Validate configuration      4  Python build environment
+#     0  Authenticate                5  Build the agent application (ADK)
+#     1  Enable required APIs         6  Deploy the agent to Agent Engine
+#     2  Create the agent's identity  7  Register the agent in Gemini Enterprise
+#     3  Create the staging bucket
 #
-#  NOTA: el modelo (gemini-2.5-flash) es intercambiable. ADK es agnostico de
-#  modelo; puedes usar Claude Sonnet, Llama, etc. via Vertex AI Model Garden o
-#  la integracion LiteLLM, cambiando esencialmente una linea en agent.py.
+#  Total time on a first run: roughly 15-20 minutes (the Agent Engine deploy
+#  is the long part).
 # =============================================================================
 
 set -euo pipefail
 
 # =============================================================================
-# CONFIGURA ESTAS VARIABLES ANTES DE EJECUTAR
-# (el PASO -1 aborta si alguna sigue con un valor YOUR_*)
+# CONFIGURATION  --  set these before running.
+# (Step -1 refuses to run while any value still starts with YOUR_.)
 # =============================================================================
 PROJECT_ID="YOUR_GOOGLE_CLOUD_PROJECT_ID"
 PROJECT_NUMBER="YOUR_PROJECT_NUMBER"
 REGION="us-central1"
-BUCKET_NAME="YOUR_GCS_BUCKET_NAME"          # unico bucket: staging del deploy + artifacts
+BUCKET_NAME="YOUR_GCS_BUCKET_NAME"          # one bucket: deploy staging + image artifacts
 BUCKET_LOCATION="US"
 
-# --- Looker (credenciales API + embed) ---
+# --- Looker connection (API credentials) ---
 LOOKER_URL="https://your-instance.looker.com"
 LOOKER_CLIENT_ID="YOUR_LOOKER_CLIENT_ID"
 LOOKER_CLIENT_SECRET="YOUR_LOOKER_CLIENT_SECRET"
-LOOKER_EMBED_SECRET="YOUR_LOOKER_EMBED_SECRET"   # para firmar los links SSO interactivos
-LOOKER_EMBED_HASH="sha1"                          # sha1 (secreto creado por UI) o sha256 (por API)
-LOOKER_MODELS='["thelook"]'                       # modelos LookML habilitados para embed
+# The embed secret is NOT read by this code. Looker signs the embed URLs on its
+# own side (we ask for them via the API). You only need to enable embedding in
+# Looker (Admin > Embed > "Embed SSO Authentication" + Reset Secret). It is
+# validated below purely as a reminder that embedding must be configured.
+LOOKER_EMBED_SECRET="YOUR_LOOKER_EMBED_SECRET"
+LOOKER_MODELS='["thelook"]'                  # LookML model(s) the agent may use
 
 # --- Gemini Enterprise ---
-AS_APP="YOUR_GEMINI_ENTERPRISE_AGENT_ID"          # ID del agente ya creado en Gemini Enterprise
-ENGINE_LOCATION="us"                              # "us", "eu" o "global"
+AS_APP="YOUR_GEMINI_ENTERPRISE_AGENT_ID"     # ID of the app already created in Gemini Enterprise
+ENGINE_LOCATION="us"                         # "us", "eu" or "global"
 AGENT_DISPLAY_NAME="Looker Agent"
 AGENT_DESCRIPTION="Looker agent that renders dashboards/charts as inline images and answers data questions."
 TOOL_DESCRIPTION="Use this tool to answer questions about Looker data and display dashboards/charts as inline images."
 # =============================================================================
 
-# Reset defensivo: limpia cualquier valor heredado del entorno para que el
-# script sea reproducible aunque se ejecute en una shell ya "sucia".
+# Defensive reset: clear any inherited values so the script behaves the same
+# whether it runs in a clean shell or a reused one.
 unset AGENT_SA AGENT_SA_NAME
 unset REASONING_ENGINE
 unset DEPLOY_LOG DEPLOY_PID DEPLOY_EXIT
@@ -94,19 +86,19 @@ unset ACCESS_TOKEN API_ENDPOINT AGENT_API_URL REQUEST_BODY
 unset HTTP_RESPONSE HTTP_STATUS RESPONSE_BODY
 unset ELAPSED MINS SECS LAST_LINE
 
-# Aborta temprano si una variable obligatoria quedo sin configurar.
+# Fail fast if a required value was left as a placeholder.
 validate_var() {
   local var_name="$1"
   local var_value="$2"
   if [[ -z "$var_value" || "$var_value" == YOUR_* ]]; then
-    echo "ERROR: La variable '$var_name' no esta configurada."
+    echo "ERROR: configuration variable '$var_name' is not set."
     exit 1
   fi
 }
 
 echo ""
 echo "=================================================="
-echo " PASO -1: Validar variables"
+echo " STEP -1: Validate configuration"
 echo "=================================================="
 validate_var "PROJECT_ID" "$PROJECT_ID"
 validate_var "PROJECT_NUMBER" "$PROJECT_NUMBER"
@@ -116,22 +108,22 @@ validate_var "LOOKER_CLIENT_ID" "$LOOKER_CLIENT_ID"
 validate_var "LOOKER_CLIENT_SECRET" "$LOOKER_CLIENT_SECRET"
 validate_var "LOOKER_EMBED_SECRET" "$LOOKER_EMBED_SECRET"
 validate_var "AS_APP" "$AS_APP"
-echo "OK: Variables configuradas."
+echo "OK: configuration looks complete."
 
 echo ""
 echo "=================================================="
-echo " PASO 0: Autenticacion"
+echo " STEP 0: Authenticate"
 echo "=================================================="
-# Muestra la identidad activa y fija el proyecto por defecto para gcloud.
+# Show the active identity and pin the default project for gcloud.
 gcloud auth list
 gcloud config set project "$PROJECT_ID"
 
 echo ""
 echo "=================================================="
-echo " PASO 1: Habilitar APIs"
+echo " STEP 1: Enable required Google Cloud APIs"
 echo "=================================================="
-# Solo lo necesario para esta arquitectura. Notar que NO se habilitan
-# run / cloudbuild / artifactregistry / secretmanager: la v8 no usa Cloud Run.
+# Only what this architecture needs. Notably absent: Cloud Run, Cloud Build and
+# Secret Manager, because the agent talks to Looker directly (no middle tier).
 gcloud services enable \
   iam.googleapis.com \
   aiplatform.googleapis.com \
@@ -143,11 +135,9 @@ gcloud services enable \
 
 echo ""
 echo "=================================================="
-echo " PASO 2: Service account del agente y permisos minimos"
+echo " STEP 2: Create the agent's identity and grant minimal permissions"
 echo "=================================================="
-
-# Unico service account necesario en la v8 (antes habia tambien uno para el
-# toolbox de Cloud Run, ya eliminado). El agente corre con esta identidad.
+# The agent runs as its own dedicated service account (least privilege).
 AGENT_SA_NAME="looker-agent-sa"
 AGENT_SA="${AGENT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
@@ -156,54 +146,61 @@ if ! gcloud iam service-accounts describe "$AGENT_SA" --project="$PROJECT_ID" &>
     --project="$PROJECT_ID" \
     --display-name="Looker Agent Engine SA"
 fi
-echo "SA Agente: $AGENT_SA"
+echo "Agent service account: $AGENT_SA"
 
 echo ""
-echo "Asignando permisos al SA del Agente (principio de minimo privilegio)..."
+echo "Granting the agent service account only the roles it needs..."
 
-# 1. Correr como Agent Engine (invocar modelos / runtime de Vertex AI).
+# Run on Agent Engine / call Vertex AI models.
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${AGENT_SA}" \
   --role="roles/aiplatform.user" \
   --condition=None &>/dev/null
 echo "  [OK] aiplatform.user"
 
-# 2. Escribir logs (observabilidad del agente en runtime).
+# Write runtime logs (observability).
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${AGENT_SA}" \
   --role="roles/logging.logWriter" \
   --condition=None &>/dev/null
 echo "  [OK] logging.logWriter"
 
-# 3. Leer/escribir objetos: staging del deploy + guardado de los ARTIFACTS de
-#    imagen (save_artifact escribe los PNG que luego renderiza Gemini Enterprise).
+# Read/write objects: deploy staging package + the rendered image artifacts.
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${AGENT_SA}" \
   --role="roles/storage.objectUser" \
   --condition=None &>/dev/null
 echo "  [OK] storage.objectUser (staging + artifacts)"
 
-echo "Permisos minimos del SA del agente asignados."
+# Allow the Agent Engine service agent to mint tokens for the custom service
+# account. This prevents a class of deploy failures (the runtime needs to act
+# as the agent's identity). Safe to run repeatedly.
+gcloud iam service-accounts add-iam-policy-binding "$AGENT_SA" \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-aiplatform-re.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountTokenCreator" \
+  --project="$PROJECT_ID" &>/dev/null || true
+echo "  [OK] reasoning-engine service agent can act as the agent SA"
+
+echo "Minimal permissions assigned."
 
 echo ""
 echo "=================================================="
-echo " PASO 3: Bucket staging (deploy + artifacts)"
+echo " STEP 3: Create the staging bucket (deploy package + artifacts)"
 echo "=================================================="
-# Un solo bucket cubre el staging del paquete del agente y el almacenamiento de
-# artifacts. Idempotente: si ya existe, no lo recrea.
+# A single bucket backs both the deploy package upload and the image artifacts.
+# Idempotent: skipped if it already exists.
 if ! gcloud storage buckets describe "gs://${BUCKET_NAME}" &>/dev/null; then
   gcloud storage buckets create "gs://${BUCKET_NAME}" --location="$BUCKET_LOCATION"
-  echo "Bucket creado: gs://${BUCKET_NAME}"
+  echo "Bucket created: gs://${BUCKET_NAME}"
 else
-  echo "Bucket ya existe."
+  echo "Bucket already exists."
 fi
 
 echo ""
 echo "=================================================="
-echo " PASO 4: Entorno Python (limpio)"
+echo " STEP 4: Prepare an isolated Python environment"
 echo "=================================================="
-# Entorno virtual aislado para construir y desplegar el agente. Se recrea desde
-# cero (rm -rf) para evitar arrastrar dependencias de corridas anteriores.
+# Built from scratch each run so no stale dependency leaks in from a prior run.
 rm -rf my-agents
 mkdir -p my-agents && cd my-agents
 
@@ -212,27 +209,27 @@ source .venv/bin/activate
 pip install --quiet --upgrade pip
 pip install --quiet google-adk looker-sdk
 pip install --quiet --upgrade "google-cloud-aiplatform[agent_engines,adk]"
+# NOTE: if a freshly released dependency ever breaks the deploy, pin exact
+# versions here AND in deploy.py's requirements so dev and runtime match.
 
 echo ""
 echo "=================================================="
-echo " PASO 5: Crear aplicacion del agente"
+echo " STEP 5: Build the agent application (ADK)"
 echo "=================================================="
 mkdir -p looker_app
 
-# __init__.py: expone el modulo agent al empaquetar con extra_packages.
+# __init__.py exposes the agent module when the package is shipped to the runtime.
 cat > looker_app/__init__.py <<'EOF'
 from . import agent
 EOF
 
-# .env: solo para pruebas locales con `adk web`. En produccion las credenciales
-# se inyectan como env_vars en agent_engines.create() (ver PASO 6 / deploy.py).
+# .env is only for local testing with `adk web`. In production the same values
+# are injected as environment variables at deploy time (see STEP 6 / deploy.py).
 cat > looker_app/.env <<EOF
 LOOKERSDK_BASE_URL=${LOOKER_URL}
 LOOKERSDK_CLIENT_ID=${LOOKER_CLIENT_ID}
 LOOKERSDK_CLIENT_SECRET=${LOOKER_CLIENT_SECRET}
 LOOKERSDK_VERIFY_SSL=true
-LOOKER_EMBED_SECRET=${LOOKER_EMBED_SECRET}
-LOOKER_EMBED_HASH=sha1
 LOOKER_MODELS=${LOOKER_MODELS}
 EOF
 
@@ -244,31 +241,25 @@ requests
 EOF
 
 # ---------------------------------------------------------------------------
-# agent.py - logica del agente (ADK). Se escribe via heredoc 'PYEOF' (comillas
-# simples) para que bash NO interpole nada: el archivo es Python puro.
+# agent.py -- the agent logic. Written through a single-quoted 'PYEOF' heredoc
+# so the shell does NOT interpolate anything; the file is pure Python.
 # ---------------------------------------------------------------------------
 cat > looker_app/agent.py <<'PYEOF'
-"""Agente Looker para Gemini Enterprise (v8).
+"""Looker analytics agent for Gemini Enterprise.
 
-Diseno:
-  - Consulta Looker DIRECTO con looker_sdk (sin MCP, sin Cloud Run, sin ID tokens).
-  - Las imagenes se entregan como ADK Artifacts (no como base64 en texto), que es
-    la unica forma fiable de renderizarlas inline en Gemini Enterprise.
-  - Las credenciales llegan por variables de entorno (mismas para el SDK).
+Responsibilities:
+  - Render Looker dashboards/Looks/charts and display them inline as images
+    (via ADK artifacts -- the image bytes never pass through the model's text).
+  - Answer data questions by querying Looker directly through its SDK.
+  - Produce signed, interactive Looker embed links on demand (Looker signs them
+    server-side, so we never hand-roll the signature).
 
-El modelo del agente es intercambiable: ADK es agnostico de modelo. Para usar
-Claude/Llama, sustituir el string del modelo por un LiteLlm(...) (Vertex AI
-Model Garden o LiteLLM) en la definicion de LlmAgent al final del archivo.
+Credentials arrive as environment variables (the Looker SDK reads LOOKERSDK_*).
 """
 
 import os
-import time
 import json
-import hmac
-import base64
-import hashlib
-import binascii
-from urllib.parse import quote_plus
+import time
 
 import looker_sdk
 from looker_sdk import models40
@@ -280,123 +271,87 @@ from google.adk.tools.load_artifacts_tool import load_artifacts_tool
 from google.genai.types import ThinkingConfig, Part
 
 # -----------------------------------------------------------------------------
-# Config desde env vars (mismas credenciales para SDK; sin MCP, sin ID tokens)
+# Configuration read from environment variables.
 # -----------------------------------------------------------------------------
 LOOKER_HOST = (
     os.environ.get("LOOKERSDK_BASE_URL", "")
     .replace("https://", "").replace("http://", "").rstrip("/")
 )
-EMBED_SECRET = os.environ.get("LOOKER_EMBED_SECRET", "")
-# Algoritmo de firma del embed secret: "sha1" si el secreto se creo por la UI de
-# Looker (lo mas comun), "sha256" si se creo por API. Si el link da 401 de firma,
-# prueba cambiando este valor.
-EMBED_HASH = os.environ.get("LOOKER_EMBED_HASH", "sha1").lower()
 LOOKER_MODELS_ENV = os.environ.get("LOOKER_MODELS", '["thelook"]')
 
+# Permissions granted to the temporary embed user inside the signed link.
+EMBED_PERMISSIONS = [
+    "access_data", "see_looks", "see_user_dashboards",
+    "see_lookml_dashboards", "explore", "save_content", "embed_browse_spaces",
+]
 
 # -----------------------------------------------------------------------------
-# Signed SSO Embed URL para Looker (link interactivo opcional bajo la imagen).
+# Reasoning model (swappable -- this does NOT affect image rendering).
 #
-# IMPORTANTE: firmamos LOCALMENTE (HMAC), NO con create_sso_embed_url. Llamar al
-# SDK aqui agrega un round-trip de red a Looker EN CADA render, y si esa llamada
-# se pone lenta o falla cuelga la tool entera -> timeout (la imagen ya estaba
-# lista pero el link la arrastra). La firma local es instantanea y sin red.
+# Rendering is handled by the tools below plus load_artifacts_tool, which work
+# the same no matter which LLM drives the agent. So you can change the model
+# freely without losing the rendering feature.
 #
-# La firma sigue la implementacion de referencia oficial de Looker
-# (github.com/looker/looker_embed_sso_examples, python_example.py). Detalles que
-# son criticos y que la version anterior tenia mal:
-#   - La URL va a /login/embed/<embed_path URL-encoded>, NO a /embed/...
-#   - El embed_path codificado (quote_plus, hex en MAYUSCULAS) es el MISMO string
-#     que se firma y que va en la URL.
-#   - nonce, time, session_length y los campos de usuario van JSON-encoded, en un
-#     ORDEN EXACTO en string_to_sign (incluye external_group_id, que faltaba).
-#   - La firma base64 se URL-encodea (quote_plus) al ponerla en el querystring.
-#   - Algoritmo segun el secreto: SHA-1 (UI) o SHA-256 (API) -> ver EMBED_HASH.
+# Default: Gemini on Vertex AI.
+AGENT_MODEL = "gemini-2.5-flash"
 #
-# Va envuelto en try/except: si algo falla, devuelve un link normal (sin firmar)
-# y NUNCA rompe ni demora la imagen.
-#
-# Requisitos en Looker (sin esto, ninguna firma sirve):
-#   - Admin > Embed: "Embed SSO Authentication" = Enabled (+ Reset Secret).
-#   - El dominio desde el que se abre el link, en el allowlist de embed.
+# To drive the agent with Anthropic Claude (e.g. Sonnet 4.6) instead:
+#   1) Enable the model in Vertex AI Model Garden
+#      (publishers/anthropic/model-garden/claude-sonnet-4-6).
+#   2) Add "litellm" to the requirements in deploy.py.
+#   3) Replace the line above with:
+#         from google.adk.models.lite_llm import LiteLlm
+#         AGENT_MODEL = LiteLlm(model="vertex_ai/claude-sonnet-4-6")
+#      (For the public Anthropic API instead of Vertex, use
+#       LiteLlm(model="anthropic/claude-sonnet-4-6") with ANTHROPIC_API_KEY set.)
 # -----------------------------------------------------------------------------
-def _generate_signed_embed_url(target_path: str, external_user_id: str = "gemini-user") -> str:
-    # Sin secreto no podemos firmar: devolvemos el link normal de la UI.
-    fallback = f"https://{LOOKER_HOST}{target_path}"
-    if not EMBED_SECRET:
-        return fallback
 
-    try:
-        # path: el MISMO valor se firma y se usa en la URL final.
-        path = "/login/embed/" + quote_plus(target_path)
 
-        # Todos estos campos van JSON-encoded (asi lo exige el contrato de Looker).
-        nonce = json.dumps(binascii.hexlify(os.urandom(16)).decode("ascii"))
-        t = json.dumps(int(time.time()))
-        session_length = json.dumps(3600)
-        ext_user_id = json.dumps(external_user_id)
-        permissions = json.dumps([
-            "access_data", "see_looks",
-            "see_user_dashboards", "see_lookml_dashboards", "explore",
-        ])
-        models = json.dumps(json.loads(LOOKER_MODELS_ENV))   # normaliza el formato
-        group_ids = json.dumps([])
-        external_group_id = json.dumps("")
-        user_attributes = json.dumps({})
-        access_filters = json.dumps({})
-        first_name = json.dumps("Gemini")
-        last_name = json.dumps("User")
-        force_logout_login = json.dumps(True)
+def _signed_embed_url(embed_path: str, external_user_id: str = "gemini-user") -> str:
+    """Ask Looker to mint a signed SSO embed URL.
 
-        # ORDEN EXACTO - no reordenar.
-        string_to_sign = "\n".join([
-            LOOKER_HOST, path, nonce, t, session_length,
-            ext_user_id, permissions, models,
-            group_ids, external_group_id, user_attributes, access_filters,
-        ])
+    We let Looker create and sign the URL server-side via create_sso_embed_url
+    instead of building the HMAC by hand. Hand-signing is error-prone (exact
+    endpoint, field order, and SHA-1 vs SHA-256 all have to match), and the API
+    does it correctly every time.
 
-        algo = hashlib.sha256 if EMBED_HASH == "sha256" else hashlib.sha1
-        signature = base64.b64encode(
-            hmac.new(EMBED_SECRET.encode("utf-8"),
-                     string_to_sign.encode("utf-8"), algo).digest()
-        ).decode("ascii")
-
-        params = {
-            "nonce": nonce, "time": t, "session_length": session_length,
-            "external_user_id": ext_user_id, "permissions": permissions,
-            "models": models, "group_ids": group_ids,
-            "external_group_id": external_group_id, "user_attributes": user_attributes,
-            "access_filters": access_filters, "signature": signature,
-            "first_name": first_name, "last_name": last_name,
-            "force_logout_login": force_logout_login,
-        }
-        # quote_plus tambien sobre la firma -> '+' se vuelve '%2B', etc.
-        query = "&".join(f"{k}={quote_plus(v)}" for k, v in params.items())
-        return f"https://{LOOKER_HOST}{path}?{query}"
-    except Exception:
-        # El link nunca debe tumbar la imagen.
-        return fallback
+    `embed_path` is the embed target, e.g. "/embed/dashboards/1".
+    """
+    sdk = looker_sdk.init40()
+    resp = sdk.create_sso_embed_url(
+        body=models40.EmbedSsoParams(
+            target_url=f"https://{LOOKER_HOST}{embed_path}",
+            session_length=3600,
+            force_logout_login=True,
+            external_user_id=external_user_id,
+            first_name="Gemini",
+            last_name="User",
+            permissions=EMBED_PERMISSIONS,
+            models=json.loads(LOOKER_MODELS_ENV),
+        )
+    )
+    return resp.url
 
 
 # =============================================================================
-# TOOLS DE IMAGEN  (via ADK Artifacts -> render nativo en Gemini Enterprise)
+# IMAGE TOOLS
 #
-# Patron clave: cada tool renderiza el PNG, lo guarda con save_artifact() y
-# DEVUELVE solo el nombre del artifact. Los bytes NO viajan en el texto del LLM.
-# El agente luego llama a load_artifacts (incluido en tools) para mostrarlo.
+# Each tool renders a PNG, stores it as an artifact, and returns ONLY the
+# artifact filename. The image bytes are never returned as text. The agent then
+# calls load_artifacts to display it. We deliberately do NOT create the embed
+# link here -- that is a separate, on-demand tool (below), to keep rendering
+# fast and off any extra network call.
 # =============================================================================
 async def show_dashboard_inline(dashboard_id: str, tool_context: ToolContext) -> dict:
-    """Renderiza un dashboard de Looker como imagen y la guarda como artifact.
+    """Render a Looker dashboard as an image and save it as an artifact.
 
     Args:
-        dashboard_id: ID numerico del dashboard.
-    Returns:
-        Dict con artifact_filename (a mostrar con load_artifacts) e interactive_url.
+        dashboard_id: numeric dashboard ID.
     """
     sdk = looker_sdk.init40()
 
-    # El render de dashboards es asincrono en Looker: se crea un "render task" y
-    # se hace polling hasta success/failure.
+    # Dashboard rendering is asynchronous in Looker: create a render task, then
+    # poll until it succeeds or fails.
     task = sdk.create_dashboard_render_task(
         dashboard_id=dashboard_id,
         result_format="png",
@@ -406,55 +361,47 @@ async def show_dashboard_inline(dashboard_id: str, tool_context: ToolContext) ->
         width=1200, height=800,
     )
 
-    # Polling con tope de 90s. Dashboards muy pesados pueden no alcanzar a
-    # terminar; en ese caso devolvemos un error claro en vez de colgarnos.
     waited = 0
-    while waited < 90:
+    while waited < 90:  # cap the wait so a heavy dashboard fails cleanly, not forever
         status = sdk.render_task(task.id)
         if status.status == "success":
             break
         if status.status == "failure":
-            return {"status": "error", "message": f"Render fallo para dashboard {dashboard_id}"}
+            return {"status": "error", "message": f"Render failed for dashboard {dashboard_id}"}
         time.sleep(2)
         waited += 2
     else:
-        return {"status": "error", "message": f"Timeout renderizando dashboard {dashboard_id}"}
+        return {"status": "error", "message": f"Timed out rendering dashboard {dashboard_id}"}
 
-    png_bytes = sdk.render_task_results(task.id)   # bytes crudos, NO base64
+    png_bytes = sdk.render_task_results(task.id)
     filename = f"dashboard_{dashboard_id}.png"
-
     try:
         await tool_context.save_artifact(
             filename=filename,
             artifact=Part.from_bytes(data=png_bytes, mime_type="image/png"),
         )
     except Exception as e:
-        return {"status": "error", "message": f"No se pudo guardar el artifact: {e}"}
+        return {"status": "error", "message": f"Could not save the image artifact: {e}"}
 
-    return {
-        "status": "success",
-        "artifact_filename": filename,
-        "interactive_url": _generate_signed_embed_url(f"/embed/dashboards/{dashboard_id}"),
-        "next_step": "Call load_artifacts with this filename to display the image, then add the interactive_url as a link.",
-    }
+    return {"status": "success", "artifact_filename": filename,
+            "next_step": "Call load_artifacts with this filename to display the image."}
 
 
 async def show_look_inline(look_id: str, tool_context: ToolContext) -> dict:
-    """Renderiza un Look (chart guardado) como imagen y la guarda como artifact.
+    """Render a Looker Look (saved chart) as an image and save it as an artifact.
 
     Args:
-        look_id: ID numerico del Look.
+        look_id: numeric Look ID.
     """
     sdk = looker_sdk.init40()
-
-    # run_look con result_format="png" es sincrono: devuelve los bytes directo.
     try:
+        # run_look with PNG output is synchronous: it returns the bytes directly.
         png_bytes = sdk.run_look(
             look_id=look_id, result_format="png",
             image_width=1000, image_height=700,
         )
     except Exception as e:
-        return {"status": "error", "message": f"Error al renderizar Look {look_id}: {e}"}
+        return {"status": "error", "message": f"Could not render Look {look_id}: {e}"}
 
     filename = f"look_{look_id}.png"
     try:
@@ -463,32 +410,27 @@ async def show_look_inline(look_id: str, tool_context: ToolContext) -> dict:
             artifact=Part.from_bytes(data=png_bytes, mime_type="image/png"),
         )
     except Exception as e:
-        return {"status": "error", "message": f"No se pudo guardar el artifact: {e}"}
+        return {"status": "error", "message": f"Could not save the image artifact: {e}"}
 
-    return {
-        "status": "success",
-        "artifact_filename": filename,
-        "interactive_url": _generate_signed_embed_url(f"/embed/looks/{look_id}"),
-        "next_step": "Call load_artifacts with this filename to display the image, then add the interactive_url as a link.",
-    }
+    return {"status": "success", "artifact_filename": filename,
+            "next_step": "Call load_artifacts with this filename to display the image."}
 
 
 async def show_query_inline(
     model: str, explore: str, fields: list, tool_context: ToolContext,
     vis_type: str = "looker_column",
 ) -> dict:
-    """Crea una query ad-hoc, la renderiza como grafico y la guarda como artifact.
+    """Build an ad-hoc query, render it as a chart, and save it as an artifact.
 
     Args:
-        model: Modelo LookML (ej: "thelook").
-        explore: Explore (ej: "order_items").
-        fields: Lista de campos LookML.
+        model: LookML model (e.g. "thelook").
+        explore: explore name (e.g. "order_items").
+        fields: list of LookML fields.
         vis_type: looker_column, looker_bar, looker_line, looker_pie, looker_scatter.
     """
     sdk = looker_sdk.init40()
-
     try:
-        # Se crea la query con vis_config para que el render salga como grafico.
+        # vis_config makes Looker render the result as a chart rather than a table.
         query = sdk.create_query(
             body=models40.WriteQuery(
                 model=model, view=explore, fields=fields,
@@ -500,7 +442,7 @@ async def show_query_inline(
             image_width=1000, image_height=700,
         )
     except Exception as e:
-        return {"status": "error", "message": f"Error al ejecutar/renderizar query: {e}"}
+        return {"status": "error", "message": f"Could not run/render the query: {e}"}
 
     filename = f"query_{model}_{explore}.png".replace("/", "_")
     try:
@@ -509,56 +451,102 @@ async def show_query_inline(
             artifact=Part.from_bytes(data=png_bytes, mime_type="image/png"),
         )
     except Exception as e:
-        return {"status": "error", "message": f"No se pudo guardar el artifact: {e}"}
+        return {"status": "error", "message": f"Could not save the image artifact: {e}"}
 
-    return {
-        "status": "success",
-        "artifact_filename": filename,
-        "interactive_url": _generate_signed_embed_url(
-            f"/embed/explore/{model}/{explore}?qid={query.client_id}"
-        ),
-        "next_step": "Call load_artifacts with this filename to display the chart, then add the interactive_url as a link.",
-    }
+    return {"status": "success", "artifact_filename": filename,
+            "next_step": "Call load_artifacts with this filename to display the chart."}
 
 
 # =============================================================================
-# TOOLS DE DATOS  (looker_sdk directo; reemplazan al antiguo toolbox MCP)
-# Devuelven datos/estructura como JSON; el agente los resume en texto o tabla.
+# SIGNED-LINK TOOLS (on demand)
+#
+# Dedicated tools so the agent can fetch a signed, interactive Looker URL
+# explicitly. Kept separate from the render tools: the image displays first and
+# the (network) call to mint the link never blocks or delays rendering.
+# =============================================================================
+def get_dashboard_link(dashboard_id: str) -> dict:
+    """Return a signed, interactive Looker URL for a dashboard."""
+    try:
+        return {"status": "success",
+                "signed_url": _signed_embed_url(f"/embed/dashboards/{dashboard_id}")}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not create the signed link: {e}"}
+
+
+def get_look_link(look_id: str) -> dict:
+    """Return a signed, interactive Looker URL for a Look."""
+    try:
+        return {"status": "success",
+                "signed_url": _signed_embed_url(f"/embed/looks/{look_id}")}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not create the signed link: {e}"}
+
+
+def get_explore_link(model: str, explore: str) -> dict:
+    """Return a signed, interactive Looker URL for an explore."""
+    try:
+        return {"status": "success",
+                "signed_url": _signed_embed_url(f"/embed/explore/{model}/{explore}")}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not create the signed link: {e}"}
+
+
+# =============================================================================
+# DATA TOOLS (text/table answers, no image)
 # =============================================================================
 def query_looker_data(
     model: str, explore: str, fields: list,
     filters: dict = None, sorts: list = None, limit: int = 100,
 ) -> dict:
-    """Ejecuta una query en Looker y devuelve las filas como JSON (sin imagen).
+    """Run a Looker query and return the rows as JSON.
 
-    Usar para responder preguntas de datos en texto/tabla.
+    If this returns an access error, the cause is almost always Looker-side: the
+    API credentials' role must include a permission set with access_data/explore
+    AND a model set that contains `model`. Use list_looker_models to see which
+    models the credentials can actually reach.
 
     Args:
-        model: Modelo LookML (ej: "thelook").
-        explore: Explore (ej: "order_items").
-        fields: Lista de campos LookML (ej: ["order_items.status", "order_items.count"]).
-        filters: Dict opcional de filtros (ej: {"order_items.status": "complete"}).
-        sorts: Lista opcional de ordenamientos (ej: ["order_items.count desc"]).
-        limit: Maximo de filas (default 100).
+        model: LookML model (e.g. "thelook").
+        explore: explore name (e.g. "order_items").
+        fields: LookML fields (e.g. ["order_items.status", "order_items.count"]).
+        filters: optional dict of filters (e.g. {"order_items.status": "complete"}).
+        sorts: optional list of sorts (e.g. ["order_items.count desc"]).
+        limit: max rows (default 100).
     """
     sdk = looker_sdk.init40()
     try:
         query = sdk.create_query(
             body=models40.WriteQuery(
                 model=model, view=explore, fields=fields,
-                filters=filters or {}, sorts=sorts or [],
-                limit=str(limit),
+                filters=filters or {}, sorts=sorts or [], limit=str(limit),
             )
         )
         rows = sdk.run_query(query_id=str(query.id), result_format="json")
         data = json.loads(rows) if isinstance(rows, str) else rows
         return {"status": "success", "row_count": len(data), "rows": data}
     except Exception as e:
-        return {"status": "error", "message": f"Error en query: {e}"}
+        return {"status": "error",
+                "message": f"Query failed (check model/explore/field names and the "
+                           f"Looker role of the API user): {e}"}
+
+
+def list_looker_models() -> dict:
+    """List the LookML models the API credentials can access.
+
+    Diagnostic helper for "cannot access data": if the model you expect is not
+    in this list, the Looker role assigned to the API credentials does not grant
+    access to it (fix it in Looker Admin, not in this code)."""
+    sdk = looker_sdk.init40()
+    try:
+        models = sdk.all_lookml_models()
+        names = [m.name for m in models if getattr(m, "name", None)]
+        return {"status": "success", "models": names}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not list models: {e}"}
 
 
 def list_looker_fields(model: str, explore: str) -> dict:
-    """Lista dimensiones y medidas de un explore (para que el agente arme queries)."""
+    """List the dimensions and measures of an explore (to build valid queries)."""
     sdk = looker_sdk.init40()
     try:
         exp = sdk.lookml_model_explore(lookml_model_name=model, explore_name=explore)
@@ -566,105 +554,59 @@ def list_looker_fields(model: str, explore: str) -> dict:
         meas = [f.name for f in (exp.fields.measures or [])] if exp.fields else []
         return {"status": "success", "dimensions": dims, "measures": meas}
     except Exception as e:
-        return {"status": "error", "message": f"Error listando campos: {e}"}
+        return {"status": "error", "message": f"Could not list fields: {e}"}
 
 
 def list_available_dashboards(search_term: str = "") -> dict:
-    """Lista dashboards disponibles en Looker (id + titulo), opcionalmente filtrados."""
+    """List available dashboards (id + title), optionally filtered by title."""
     sdk = looker_sdk.init40()
     if search_term:
         dashboards = sdk.search_dashboards(title=f"%{search_term}%", limit=20)
     else:
         dashboards = sdk.search_dashboards(limit=20)
-
     if not dashboards:
         return {"status": "success", "dashboards": []}
-
-    items = [{"id": str(d.id), "title": d.title} for d in dashboards]
-    return {"status": "success", "dashboards": items}
+    return {"status": "success",
+            "dashboards": [{"id": str(d.id), "title": d.title} for d in dashboards]}
 
 
 # =============================================================================
-# TOOLS DE LINK FIRMADO (URL SSO interactiva)
-# Metodos dedicados para que el agente OBTENGA el link explicitamente, en vez de
-# depender de que reproduzca el campo interactive_url del render (que a veces
-# omite). Si el usuario pide "el link" / "la version interactiva", el agente
-# llama a uno de estos y devuelve signed_url tal cual.
-# =============================================================================
-def get_dashboard_link(dashboard_id: str) -> dict:
-    """Devuelve la URL SSO firmada (interactiva) de un dashboard de Looker.
-
-    Args:
-        dashboard_id: ID numerico del dashboard.
-    """
-    if not EMBED_SECRET:
-        return {"status": "error",
-                "message": "LOOKER_EMBED_SECRET no esta configurado; no se puede firmar el link."}
-    return {"status": "success",
-            "signed_url": _generate_signed_embed_url(f"/embed/dashboards/{dashboard_id}")}
-
-
-def get_look_link(look_id: str) -> dict:
-    """Devuelve la URL SSO firmada (interactiva) de un Look de Looker.
-
-    Args:
-        look_id: ID numerico del Look.
-    """
-    if not EMBED_SECRET:
-        return {"status": "error",
-                "message": "LOOKER_EMBED_SECRET no esta configurado; no se puede firmar el link."}
-    return {"status": "success",
-            "signed_url": _generate_signed_embed_url(f"/embed/looks/{look_id}")}
-
-
-def get_explore_link(model: str, explore: str) -> dict:
-    """Devuelve la URL SSO firmada (interactiva) de un explore de Looker.
-
-    Args:
-        model: Modelo LookML (ej: "thelook").
-        explore: Explore (ej: "order_items").
-    """
-    if not EMBED_SECRET:
-        return {"status": "error",
-                "message": "LOOKER_EMBED_SECRET no esta configurado; no se puede firmar el link."}
-    return {"status": "success",
-            "signed_url": _generate_signed_embed_url(f"/embed/explore/{model}/{explore}")}
-
-
-# =============================================================================
-# Definicion del agente ADK
-#  - model: intercambiable (ver docstring del modulo).
-#  - instruction: enseña el patron "renderiza -> load_artifacts -> link".
-#  - planner: thinking desactivado (thinking_budget=0) para respuestas directas.
-#  - tools: imagenes + datos + load_artifacts_tool (el que muestra el artifact).
+# Agent definition.
+#   - model: swappable (see AGENT_MODEL above); rendering is unaffected.
+#   - instruction: teaches the render -> load_artifacts -> link pattern and how
+#     to answer data questions and diagnose access errors.
+#   - planner: thinking disabled (budget 0) for direct, low-latency answers.
 # =============================================================================
 root_agent = LlmAgent(
-    model='gemini-2.5-flash',
+    model=AGENT_MODEL,
     name='looker_agent',
-    description='Looker agent: renders dashboards/charts as inline images (ADK artifacts) and answers data questions via the Looker SDK.',
+    description='Looker agent: renders dashboards/charts as inline images and answers data questions via the Looker SDK.',
     instruction=(
-        'You are a Looker data agent inside Gemini Enterprise.\n\n'
-        'HOW TO SHOW IMAGES (dashboards / looks / charts):\n'
-        '1. Call the matching tool: show_dashboard_inline, show_look_inline, or '
-        'show_query_inline. Each one renders the image and SAVES it as an artifact, '
-        'returning an "artifact_filename".\n'
-        '2. Then call load_artifacts with that filename so the image is displayed '
-        'inline in the chat. This is the ONLY way the image renders - never try to '
-        'output image bytes or base64 yourself.\n'
-        '3. ALWAYS provide the interactive link too: call get_dashboard_link / '
-        'get_look_link / get_explore_link for the same id, and output the returned '
-        '"signed_url" as a markdown link "[Abrir version interactiva en Looker](signed_url)". '
-        'Do this every time you show an image. Output the signed_url EXACTLY as returned.\n\n'
-        'IF THE USER ASKS ONLY FOR THE LINK (no image): call get_dashboard_link / '
-        'get_look_link / get_explore_link directly and return the signed_url as a link.\n\n'
-        'HOW TO ANSWER DATA QUESTIONS (numbers, no chart needed):\n'
-        '- Use query_looker_data(model, explore, fields, ...) and summarize the '
-        'returned rows in plain text or a small markdown table.\n'
-        '- If unsure which fields exist, call list_looker_fields(model, explore) first.\n'
-        '- To find dashboards by name, use list_available_dashboards.\n\n'
-        'If a tool returns status="error", tell the user the message plainly and '
-        'suggest a fix (e.g. wrong id, field name, model, or missing embed secret).\n\n'
-        'Defaults when unsure: model="thelook", explore="order_items".\n'
+        'You are a Looker analytics agent inside Gemini Enterprise.\n\n'
+        'TO SHOW AN IMAGE (dashboard / look / chart):\n'
+        '1. Call show_dashboard_inline, show_look_inline, or show_query_inline. '
+        'Each renders the image and saves it as an artifact, returning '
+        '"artifact_filename".\n'
+        '2. Call load_artifacts with that filename to display it inline. This is '
+        'the ONLY way the image renders; never output image bytes or base64.\n'
+        '3. Then ALSO provide the interactive link: call get_dashboard_link / '
+        'get_look_link / get_explore_link for the same item and output the '
+        'returned "signed_url" as a markdown link '
+        '"[Open the interactive version in Looker](signed_url)". Output the '
+        'signed_url exactly as returned.\n\n'
+        'IF THE USER ASKS ONLY FOR THE LINK: call the matching get_*_link tool '
+        'directly and return the signed_url.\n\n'
+        'TO ANSWER A DATA QUESTION (numbers, no chart):\n'
+        '- Use query_looker_data and summarize the rows in plain text or a small '
+        'markdown table.\n'
+        '- If you are unsure which model/explore/fields exist, call '
+        'list_looker_models, then list_looker_fields, before querying.\n'
+        '- If a data tool returns an access error, call list_looker_models and '
+        'tell the user plainly which models are accessible; the Looker role of '
+        'the API credentials may simply not grant access to the requested model.\n\n'
+        'When any tool returns status="error", relay the message plainly and '
+        'suggest a concrete fix.\n\n'
+        'Hints when unsure: model="thelook", explore="order_items". '
         'vis_type options: looker_column, looker_bar, looker_line, looker_pie, looker_scatter.'
     ),
     planner=BuiltInPlanner(
@@ -678,25 +620,26 @@ root_agent = LlmAgent(
         get_look_link,
         get_explore_link,
         query_looker_data,
+        list_looker_models,
         list_looker_fields,
         list_available_dashboards,
-        load_artifacts_tool,   # <-- el que efectivamente renderiza los artifacts en el chat
+        load_artifacts_tool,   # displays the saved artifacts in the chat
     ],
 )
 PYEOF
 
-echo "Agente creado (sin MCP, imagenes via artifacts)."
+echo "Agent application created (images via artifacts, links via Looker SSO API)."
 
 echo ""
 echo "=================================================="
-echo " PASO 6: Deploy a Agent Engine (Python SDK)"
-echo "  (tarda 15-20 min, usando SA: $AGENT_SA)"
+echo " STEP 6: Deploy the agent to Vertex AI Agent Engine"
+echo "  (takes ~15-20 min; runs as: $AGENT_SA)"
 echo "=================================================="
 
-# deploy.py empaqueta el agente y lo crea como Reasoning Engine en Vertex AI.
-# Las credenciales de Looker se inyectan aqui como env_vars (no se hornean en
-# el codigo). AdkApp en Agent Engine provee session + artifact service
-# gestionados, por lo que save_artifact() funciona en runtime sin config extra.
+# deploy.py packages the agent and creates it as a managed Reasoning Engine.
+# Looker credentials are injected here as environment variables (never baked
+# into the code). Agent Engine provides the managed session + artifact services,
+# so saving image artifacts works at runtime with no extra wiring.
 cat > deploy.py <<'DEPLOYEOF'
 import os
 import sys
@@ -711,63 +654,57 @@ REGION = os.environ["REGION"]
 STAGING_BUCKET = f"gs://{os.environ['BUCKET_NAME']}"
 AGENT_SA = os.environ["AGENT_SA"]
 
-vertexai.init(
-    project=PROJECT_ID,
-    location=REGION,
-    staging_bucket=STAGING_BUCKET,
-)
+vertexai.init(project=PROJECT_ID, location=REGION, staging_bucket=STAGING_BUCKET)
 
-print(f"Desplegando agente con SA: {AGENT_SA}", flush=True)
+print(f"Deploying agent as service account: {AGENT_SA}", flush=True)
 print(f"Staging bucket: {STAGING_BUCKET}", flush=True)
 
-app = reasoning_engines.AdkApp(agent=root_agent, enable_tracing=True)
+app = reasoning_engines.AdkApp(agent=root_agent, enable_tracing=False)
 
 env_vars = {
     "LOOKERSDK_BASE_URL": os.environ["LOOKER_URL"],
     "LOOKERSDK_CLIENT_ID": os.environ["LOOKER_CLIENT_ID"],
     "LOOKERSDK_CLIENT_SECRET": os.environ["LOOKER_CLIENT_SECRET"],
     "LOOKERSDK_VERIFY_SSL": "true",
-    "LOOKER_EMBED_SECRET": os.environ["LOOKER_EMBED_SECRET"],
-    "LOOKER_EMBED_HASH": os.environ.get("LOOKER_EMBED_HASH", "sha1"),
     "LOOKER_MODELS": os.environ.get("LOOKER_MODELS", '["thelook"]'),
 }
 
 try:
     remote_app = agent_engines.create(
         agent_engine=app,
-        display_name="looker-agent1",
+        display_name="gemini-looker-agent",
         requirements=[
             "google-adk",
             "looker_sdk",
             "google-auth",
             "google-cloud-aiplatform[agent_engines,adk]",
             "requests",
+            # If you switch the model to Claude via LiteLlm, also add "litellm".
         ],
         extra_packages=["./looker_app"],
         service_account=AGENT_SA,
         env_vars=env_vars,
     )
-    # Esta linea es la que el script de bash parsea para obtener el recurso.
+    # The shell script parses this exact line to capture the resource name.
     print(f"AGENT_ENGINE_RESOURCE_NAME={remote_app.resource_name}", flush=True)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr, flush=True)
     sys.exit(1)
 DEPLOYEOF
 
-# Exporta lo que deploy.py lee desde os.environ.
+# Export what deploy.py reads from the environment.
 export PROJECT_ID REGION BUCKET_NAME AGENT_SA
-export LOOKER_URL LOOKER_CLIENT_ID LOOKER_CLIENT_SECRET
-export LOOKER_EMBED_SECRET LOOKER_MODELS LOOKER_EMBED_HASH
+export LOOKER_URL LOOKER_CLIENT_ID LOOKER_CLIENT_SECRET LOOKER_MODELS
 
-# El deploy es largo: se corre en background y se imprime un "latido" cada 15s
-# con la ultima linea del log, para que la terminal (p.ej. Cloud Shell) no
-# parezca colgada y no expire por inactividad.
+# The deploy is long, so run it in the background and print a heartbeat with the
+# latest log line every 15s. This keeps interactive terminals (e.g. Cloud Shell)
+# from looking frozen or timing out on inactivity.
 DEPLOY_LOG="/tmp/adk_deploy_$$.log"
 > "$DEPLOY_LOG"
 
 python deploy.py > "$DEPLOY_LOG" 2>&1 &
 DEPLOY_PID=$!
-echo "Deploy en background (PID: $DEPLOY_PID)"
+echo "Deploy running in background (PID: $DEPLOY_PID)"
 
 ELAPSED=0
 while kill -0 $DEPLOY_PID 2>/dev/null; do
@@ -783,31 +720,29 @@ wait $DEPLOY_PID
 DEPLOY_EXIT=$?
 
 echo ""
-echo "=== OUTPUT DEL DEPLOY ==="
+echo "=== DEPLOY OUTPUT ==="
 cat "$DEPLOY_LOG"
-echo "========================="
+echo "====================="
 
 if [ $DEPLOY_EXIT -ne 0 ]; then
-  echo "ERROR: Deploy fallo"
+  echo "ERROR: deploy failed (see output above; for runtime errors check Logs"
+  echo "       Explorer -> resource type 'Vertex AI Reasoning Engine')."
   exit 1
 fi
 
-# --- Obtener el resource name del Reasoning Engine (3 metodos, en cascada) ---
-# 1) Linea explicita que imprimio deploy.py.
+# Capture the Reasoning Engine resource name (three fallbacks, in order).
 REASONING_ENGINE=$(grep "AGENT_ENGINE_RESOURCE_NAME=" "$DEPLOY_LOG" | tail -1 | cut -d= -f2- || true)
 
-# 2) Regex sobre el log por si la linea anterior no esta.
 if [ -z "$REASONING_ENGINE" ]; then
   REASONING_ENGINE=$(grep -oE 'projects/[^/]+/locations/[^/]+/reasoningEngines/[0-9]+' "$DEPLOY_LOG" | head -1 || true)
 fi
 
-# 3) Ultimo recurso: consultar la API de reasoningEngines y filtrar por display name.
 if [ -z "$REASONING_ENGINE" ]; then
   cat > /tmp/extract_engine.py <<'PYPARSER'
 import json, sys
 try:
     d = json.load(sys.stdin)
-    engines = [e for e in d.get('reasoningEngines', []) if e.get('displayName') == 'looker-agent1']
+    engines = [e for e in d.get('reasoningEngines', []) if e.get('displayName') == 'gemini-looker-agent']
     if engines:
         print(engines[-1]['name'])
 except Exception:
@@ -819,7 +754,7 @@ PYPARSER
 fi
 
 if [ -z "$REASONING_ENGINE" ]; then
-  echo "ERROR: No se pudo obtener Reasoning Engine"
+  echo "ERROR: could not determine the Reasoning Engine resource name."
   exit 1
 fi
 
@@ -829,13 +764,13 @@ cd ..
 
 echo ""
 echo "=================================================="
-echo " PASO 7: Registrar en Gemini Enterprise"
+echo " STEP 7: Register the agent in Gemini Enterprise"
 echo "=================================================="
-# Asocia el Reasoning Engine recien creado como un agente del assistant por
-# defecto de tu app de Gemini Enterprise (Discovery Engine API).
+# Attach the deployed Reasoning Engine as an agent of your Gemini Enterprise
+# app's default assistant (Discovery Engine API).
 ACCESS_TOKEN=$(gcloud auth print-access-token)
 
-# El host de la API depende de la location del engine (global vs regional).
+# The API host depends on the engine location (global vs regional).
 if [ "$ENGINE_LOCATION" = "global" ]; then
   API_ENDPOINT="discoveryengine.googleapis.com"
 else
@@ -856,9 +791,9 @@ REQUEST_BODY=$(cat <<EOF
 EOF
 )
 
-echo "POST a: $AGENT_API_URL"
+echo "POST to: $AGENT_API_URL"
 
-# Se captura cuerpo + status code juntos para poder reportar errores con detalle.
+# Capture body + status code together so failures can be reported with detail.
 HTTP_RESPONSE=$(curl -sS -w "\n__HTTP_STATUS__:%{http_code}" -X POST \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
   -H "Content-Type: application/json" \
@@ -872,30 +807,35 @@ echo "HTTP Status: $HTTP_STATUS"
 echo "$RESPONSE_BODY" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE_BODY"
 
 if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
-  echo "OK: Agente registrado en Gemini Enterprise"
+  echo "OK: agent registered in Gemini Enterprise"
 else
-  echo "ERROR HTTP $HTTP_STATUS"
+  echo "ERROR: HTTP $HTTP_STATUS"
   exit 1
 fi
 
 echo ""
 echo "=================================================="
-echo " SETUP COMPLETO"
+echo " SETUP COMPLETE"
 echo "=================================================="
 echo ""
 echo "  Reasoning Engine : $REASONING_ENGINE"
 echo "  Agent SA         : $AGENT_SA"
 echo "  Staging/Artifacts: gs://${BUCKET_NAME}"
 echo ""
-echo "Imagenes -> ADK Artifacts (render nativo en Gemini Enterprise)"
-echo "Datos    -> looker_sdk directo (sin MCP / sin Cloud Run / sin ID tokens)"
+echo "Images  -> ADK artifacts (rendered natively in Gemini Enterprise)"
+echo "Links   -> Looker-signed SSO embed URLs (created via the Looker API)"
+echo "Data    -> Looker SDK queries (no middle tier)"
 echo ""
-echo "Prueba con:"
-echo "  - 'Muestrame el dashboard 1'"
-echo "  - 'Ensename el Look 5'"
-echo "  - 'Visualiza ordenes por estado como grafico de barras'"
-echo "  - 'Cuantas ordenes hay por estado?' (respuesta en datos, sin imagen)"
+echo "Try:"
+echo "  - 'Show me dashboard 1'"
+echo "  - 'Show me look 5'"
+echo "  - 'Chart orders by status as a bar chart'"
+echo "  - 'How many orders are there per status?'  (data answer, no image)"
+echo "  - 'Give me the interactive link to dashboard 1'"
 echo ""
-echo "Configuracion manual en Looker Admin > Embed (para los links interactivos):"
-echo "  1. ACTIVAR 'Embed SSO Authentication'"
-echo "  2. Agregar el dominio de Gemini Enterprise al allowlist"
+echo "In Looker Admin > Embed (required for the interactive links):"
+echo "  1. Enable 'Embed SSO Authentication' (and Reset Secret)."
+echo "  2. Add the Gemini Enterprise domain to the embed allowlist."
+echo "  3. Make sure the API user's role can access the model(s) in LOOKER_MODELS,"
+echo "     otherwise data queries will return an access error."
+
