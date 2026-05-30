@@ -585,6 +585,53 @@ def list_available_dashboards(search_term: str = "") -> dict:
 
 
 # =============================================================================
+# TOOLS DE LINK FIRMADO (URL SSO interactiva)
+# Metodos dedicados para que el agente OBTENGA el link explicitamente, en vez de
+# depender de que reproduzca el campo interactive_url del render (que a veces
+# omite). Si el usuario pide "el link" / "la version interactiva", el agente
+# llama a uno de estos y devuelve signed_url tal cual.
+# =============================================================================
+def get_dashboard_link(dashboard_id: str) -> dict:
+    """Devuelve la URL SSO firmada (interactiva) de un dashboard de Looker.
+
+    Args:
+        dashboard_id: ID numerico del dashboard.
+    """
+    if not EMBED_SECRET:
+        return {"status": "error",
+                "message": "LOOKER_EMBED_SECRET no esta configurado; no se puede firmar el link."}
+    return {"status": "success",
+            "signed_url": _generate_signed_embed_url(f"/embed/dashboards/{dashboard_id}")}
+
+
+def get_look_link(look_id: str) -> dict:
+    """Devuelve la URL SSO firmada (interactiva) de un Look de Looker.
+
+    Args:
+        look_id: ID numerico del Look.
+    """
+    if not EMBED_SECRET:
+        return {"status": "error",
+                "message": "LOOKER_EMBED_SECRET no esta configurado; no se puede firmar el link."}
+    return {"status": "success",
+            "signed_url": _generate_signed_embed_url(f"/embed/looks/{look_id}")}
+
+
+def get_explore_link(model: str, explore: str) -> dict:
+    """Devuelve la URL SSO firmada (interactiva) de un explore de Looker.
+
+    Args:
+        model: Modelo LookML (ej: "thelook").
+        explore: Explore (ej: "order_items").
+    """
+    if not EMBED_SECRET:
+        return {"status": "error",
+                "message": "LOOKER_EMBED_SECRET no esta configurado; no se puede firmar el link."}
+    return {"status": "success",
+            "signed_url": _generate_signed_embed_url(f"/embed/explore/{model}/{explore}")}
+
+
+# =============================================================================
 # Definicion del agente ADK
 #  - model: intercambiable (ver docstring del modulo).
 #  - instruction: enseña el patron "renderiza -> load_artifacts -> link".
@@ -604,15 +651,19 @@ root_agent = LlmAgent(
         '2. Then call load_artifacts with that filename so the image is displayed '
         'inline in the chat. This is the ONLY way the image renders - never try to '
         'output image bytes or base64 yourself.\n'
-        '3. After the image, add a short caption and the "interactive_url" as a '
-        'markdown link "[Abrir version interactiva en Looker](URL)".\n\n'
+        '3. ALWAYS provide the interactive link too: call get_dashboard_link / '
+        'get_look_link / get_explore_link for the same id, and output the returned '
+        '"signed_url" as a markdown link "[Abrir version interactiva en Looker](signed_url)". '
+        'Do this every time you show an image. Output the signed_url EXACTLY as returned.\n\n'
+        'IF THE USER ASKS ONLY FOR THE LINK (no image): call get_dashboard_link / '
+        'get_look_link / get_explore_link directly and return the signed_url as a link.\n\n'
         'HOW TO ANSWER DATA QUESTIONS (numbers, no chart needed):\n'
         '- Use query_looker_data(model, explore, fields, ...) and summarize the '
         'returned rows in plain text or a small markdown table.\n'
         '- If unsure which fields exist, call list_looker_fields(model, explore) first.\n'
         '- To find dashboards by name, use list_available_dashboards.\n\n'
         'If a tool returns status="error", tell the user the message plainly and '
-        'suggest a fix (e.g. wrong id, field name, or model).\n\n'
+        'suggest a fix (e.g. wrong id, field name, model, or missing embed secret).\n\n'
         'Defaults when unsure: model="thelook", explore="order_items".\n'
         'vis_type options: looker_column, looker_bar, looker_line, looker_pie, looker_scatter.'
     ),
@@ -623,6 +674,9 @@ root_agent = LlmAgent(
         show_dashboard_inline,
         show_look_inline,
         show_query_inline,
+        get_dashboard_link,
+        get_look_link,
+        get_explore_link,
         query_looker_data,
         list_looker_fields,
         list_available_dashboards,
