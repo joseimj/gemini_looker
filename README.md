@@ -207,7 +207,3 @@ If a data query returns an access error ("cannot access data"), the cause is alm
 **Dashboard render times out.** Heavy dashboards can be slow; the render task is capped at 90s. Try a Look or an ad‑hoc query (faster), or raise the cap in `show_dashboard_inline`.
 
 ---
-
-## License
-
-Set your repository license here (e.g. MIT). _TODO._
