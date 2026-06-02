@@ -75,6 +75,21 @@ ENGINE_LOCATION="us"                         # "us", "eu" or "global"
 AGENT_DISPLAY_NAME="Looker Agent"
 AGENT_DESCRIPTION="Looker agent that renders dashboards/charts as inline images and answers data questions."
 TOOL_DESCRIPTION="Use this tool to answer questions about Looker data and display dashboards/charts as inline images."
+
+# --- Reasoning model ---
+# "claude"        -> Claude on Vertex AI via LiteLlm (no API key; billed via GCP).
+# "claude_native" -> Claude on Vertex AI via ADK's native Claude wrapper (a
+#                    DIFFERENT code path than LiteLlm; try this if LiteLlm streams
+#                    OK via stream_query but Gemini Enterprise returns "size 0").
+# "anthropic"     -> Claude via the public Anthropic API (needs ANTHROPIC_API_KEY).
+# "gemini"        -> Gemini on Vertex AI.
+# For "claude"/"claude_native": ENABLE the model in Vertex AI Model Garden and set
+# CLAUDE_LOCATION to a region that serves it.
+# NOTE: claude + anthropic both go through LiteLlm. claude_native does not.
+AGENT_MODEL_PROVIDER="claude"          # "claude", "claude_native", "anthropic" or "gemini"
+CLAUDE_MODEL="claude-sonnet-4-6"       # model id (check Model Garden card; may need @version)
+CLAUDE_LOCATION="us-east5"             # Vertex region that serves Claude (from Model Garden)
+GEMINI_MODEL="gemini-2.5-flash"        # used when provider="gemini"
 # =============================================================================
 
 # Defensive reset: clear any inherited values so the script behaves the same
@@ -132,6 +147,43 @@ gcloud services enable \
   storage.googleapis.com \
   cloudresourcemanager.googleapis.com \
   --project="$PROJECT_ID"
+
+echo ""
+echo "=================================================="
+echo " STEP 1b: Preflight - verify the Claude model is enabled"
+echo "=================================================="
+# Enabling an Anthropic model in Model Garden (accepting its terms) is a one-time
+# Console action that cannot be reliably scripted. What we CAN do is fail fast:
+# make a tiny rawPredict call and confirm the model is enabled and served in the
+# chosen region BEFORE the 15-20 min deploy. Only relevant for the Claude routes.
+if [[ "$AGENT_MODEL_PROVIDER" == "claude" || "$AGENT_MODEL_PROVIDER" == "claude_native" ]]; then
+  if [ "$CLAUDE_LOCATION" = "global" ]; then
+    PF_HOST="aiplatform.googleapis.com"
+  else
+    PF_HOST="${CLAUDE_LOCATION}-aiplatform.googleapis.com"
+  fi
+  PF_URL="https://${PF_HOST}/v1/projects/${PROJECT_ID}/locations/${CLAUDE_LOCATION}/publishers/anthropic/models/${CLAUDE_MODEL}:rawPredict"
+  echo "Checking ${CLAUDE_MODEL} in ${CLAUDE_LOCATION}..."
+  PF_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+    -H "Content-Type: application/json" \
+    "$PF_URL" \
+    -d '{"anthropic_version":"vertex-2023-10-16","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' || echo "000")
+  if [[ "$PF_CODE" == "200" ]]; then
+    echo "OK: ${CLAUDE_MODEL} is enabled and reachable in ${CLAUDE_LOCATION}."
+  else
+    echo "ERROR: ${CLAUDE_MODEL} is NOT reachable in ${CLAUDE_LOCATION} (HTTP ${PF_CODE})."
+    echo "  - 404: the model is not enabled in this project, or not served in this"
+    echo "         region (try a different CLAUDE_LOCATION, or the global endpoint),"
+    echo "         or the model id needs a version suffix (e.g. ${CLAUDE_MODEL}@<date>)."
+    echo "  - 403: the caller lacks permission (needs roles/aiplatform.user)."
+    echo "Enable it here, then re-run:"
+    echo "  https://console.cloud.google.com/vertex-ai/publishers/anthropic/model-garden/${CLAUDE_MODEL}?project=${PROJECT_ID}"
+    exit 1
+  fi
+else
+  echo "Skipped (AGENT_MODEL_PROVIDER=${AGENT_MODEL_PROVIDER})."
+fi
 
 echo ""
 echo "=================================================="
@@ -207,7 +259,7 @@ mkdir -p my-agents && cd my-agents
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --quiet --upgrade pip
-pip install --quiet google-adk looker-sdk
+pip install --quiet google-adk looker-sdk litellm
 pip install --quiet --upgrade "google-cloud-aiplatform[agent_engines,adk]"
 # NOTE: if a freshly released dependency ever breaks the deploy, pin exact
 # versions here AND in deploy.py's requirements so dev and runtime match.
@@ -231,6 +283,12 @@ LOOKERSDK_CLIENT_ID=${LOOKER_CLIENT_ID}
 LOOKERSDK_CLIENT_SECRET=${LOOKER_CLIENT_SECRET}
 LOOKERSDK_VERIFY_SSL=true
 LOOKER_MODELS=${LOOKER_MODELS}
+AGENT_MODEL_PROVIDER=${AGENT_MODEL_PROVIDER}
+CLAUDE_MODEL=${CLAUDE_MODEL}
+GEMINI_MODEL=${GEMINI_MODEL}
+VERTEXAI_PROJECT=${PROJECT_ID}
+VERTEXAI_LOCATION=${CLAUDE_LOCATION}
+GOOGLE_GENAI_USE_VERTEXAI=true
 EOF
 
 cat > looker_app/requirements.txt <<EOF
@@ -260,6 +318,7 @@ Credentials arrive as environment variables (the Looker SDK reads LOOKERSDK_*).
 import os
 import json
 import time
+from urllib.parse import urlencode
 
 import looker_sdk
 from looker_sdk import models40
@@ -279,6 +338,22 @@ LOOKER_HOST = (
 )
 LOOKER_MODELS_ENV = os.environ.get("LOOKER_MODELS", '["thelook"]')
 
+
+def _models_list():
+    """Parse LOOKER_MODELS into a list of model names, tolerant of formatting.
+
+    Accepts valid JSON like '["a","b"]' but also forgives common slips such as
+    '[a]' (missing quotes), 'a' (bare name), or 'a, b' (comma-separated). A
+    signed embed URL requires at least one model name."""
+    raw = (LOOKER_MODELS_ENV or "").strip()
+    try:
+        val = json.loads(raw)
+        return [val] if isinstance(val, str) else list(val)
+    except Exception:
+        cleaned = raw.strip("[]")
+        return [m.strip().strip('"').strip("'") for m in cleaned.split(",") if m.strip()]
+
+
 # Permissions granted to the temporary embed user inside the signed link.
 EMBED_PERMISSIONS = [
     "access_data", "see_looks", "see_user_dashboards",
@@ -289,21 +364,37 @@ EMBED_PERMISSIONS = [
 # Reasoning model (swappable -- this does NOT affect image rendering).
 #
 # Rendering is handled by the tools below plus load_artifacts_tool, which work
-# the same no matter which LLM drives the agent. So you can change the model
-# freely without losing the rendering feature.
+# the same no matter which LLM drives the agent, so changing the model never
+# breaks the image feature.
 #
-# Default: Gemini on Vertex AI.
-AGENT_MODEL = "gemini-2.5-flash"
-#
-# To drive the agent with Anthropic Claude (e.g. Sonnet 4.6) instead:
-#   1) Enable the model in Vertex AI Model Garden
-#      (publishers/anthropic/model-garden/claude-sonnet-4-6).
-#   2) Add "litellm" to the requirements in deploy.py.
-#   3) Replace the line above with:
-#         from google.adk.models.lite_llm import LiteLlm
-#         AGENT_MODEL = LiteLlm(model="vertex_ai/claude-sonnet-4-6")
-#      (For the public Anthropic API instead of Vertex, use
-#       LiteLlm(model="anthropic/claude-sonnet-4-6") with ANTHROPIC_API_KEY set.)
+# Controlled by env vars (set in the script's config block):
+#   AGENT_MODEL_PROVIDER = "claude"    -> Claude Sonnet on Vertex AI via LiteLlm
+#                        = "anthropic" -> Claude Sonnet via the public Anthropic API
+#                        = "gemini"    -> Gemini on Vertex AI
+# For "claude" the model must be enabled in Vertex AI Model Garden and
+# VERTEXAI_PROJECT / VERTEXAI_LOCATION must point to a region that serves it.
+# For "anthropic" the ANTHROPIC_API_KEY env var must be set.
+# -----------------------------------------------------------------------------
+_PROVIDER = os.environ.get("AGENT_MODEL_PROVIDER", "gemini").lower()
+_CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+if _PROVIDER == "claude":
+    from google.adk.models.lite_llm import LiteLlm
+    AGENT_MODEL = LiteLlm(model=f"vertex_ai/{_CLAUDE_MODEL}")
+elif _PROVIDER == "claude_native":
+    # ADK's native Anthropic-on-Vertex wrapper (NOT LiteLlm). Routes the model
+    # string to the Claude class after registration. Needs anthropic[vertex] and
+    # GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION. NOTE: older google-adk only
+    # matched claude-3* model names; make sure you are on a recent version so
+    # claude-sonnet-4-6 is recognized, otherwise it falls back / fails.
+    from google.adk.models.anthropic_llm import Claude
+    from google.adk.models.registry import LLMRegistry
+    LLMRegistry.register(Claude)
+    AGENT_MODEL = _CLAUDE_MODEL
+elif _PROVIDER == "anthropic":
+    from google.adk.models.lite_llm import LiteLlm
+    AGENT_MODEL = LiteLlm(model=f"anthropic/{_CLAUDE_MODEL}")
+else:
+    AGENT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # -----------------------------------------------------------------------------
 
 
@@ -327,7 +418,7 @@ def _signed_embed_url(embed_path: str, external_user_id: str = "gemini-user") ->
             first_name="Gemini",
             last_name="User",
             permissions=EMBED_PERMISSIONS,
-            models=json.loads(LOOKER_MODELS_ENV),
+            models=_models_list(),
         )
     )
     return resp.url
@@ -342,13 +433,21 @@ def _signed_embed_url(embed_path: str, external_user_id: str = "gemini-user") ->
 # link here -- that is a separate, on-demand tool (below), to keep rendering
 # fast and off any extra network call.
 # =============================================================================
-async def show_dashboard_inline(dashboard_id: str, tool_context: ToolContext) -> dict:
+async def show_dashboard_inline(dashboard_id: str, tool_context: ToolContext,
+                                filters: dict = None) -> dict:
     """Render a Looker dashboard as an image and save it as an artifact.
 
     Args:
         dashboard_id: numeric dashboard ID.
+        filters: optional dict of dashboard filters to apply before rendering,
+            keyed by the dashboard's filter NAMES, e.g.
+            {"Country": "Brazil", "Order Created Date": "30 days"}.
+            Use list_dashboard_filters(dashboard_id) to discover valid names.
     """
     sdk = looker_sdk.init40()
+
+    # Looker expects dashboard filters in URL-query format (name=value&...).
+    dashboard_filters = urlencode(filters) if filters else ""
 
     # Dashboard rendering is asynchronous in Looker: create a render task, then
     # poll until it succeeds or fails.
@@ -356,7 +455,7 @@ async def show_dashboard_inline(dashboard_id: str, tool_context: ToolContext) ->
         dashboard_id=dashboard_id,
         result_format="png",
         body=models40.CreateDashboardRenderTask(
-            dashboard_style="tiled", dashboard_filters=""
+            dashboard_style="tiled", dashboard_filters=dashboard_filters
         ),
         width=1200, height=800,
     )
@@ -464,11 +563,19 @@ async def show_query_inline(
 # explicitly. Kept separate from the render tools: the image displays first and
 # the (network) call to mint the link never blocks or delays rendering.
 # =============================================================================
-def get_dashboard_link(dashboard_id: str) -> dict:
-    """Return a signed, interactive Looker URL for a dashboard."""
+def get_dashboard_link(dashboard_id: str, filters: dict = None) -> dict:
+    """Return a signed, interactive Looker URL for a dashboard.
+
+    Args:
+        dashboard_id: numeric dashboard ID.
+        filters: optional dict of dashboard filters (same names as the dashboard),
+            so the opened link is pre-filtered, e.g. {"Country": "Brazil"}.
+    """
     try:
-        return {"status": "success",
-                "signed_url": _signed_embed_url(f"/embed/dashboards/{dashboard_id}")}
+        path = f"/embed/dashboards/{dashboard_id}"
+        if filters:
+            path += "?" + urlencode(filters)
+        return {"status": "success", "signed_url": _signed_embed_url(path)}
     except Exception as e:
         return {"status": "error", "message": f"Could not create the signed link: {e}"}
 
@@ -531,18 +638,37 @@ def query_looker_data(
 
 
 def list_looker_models() -> dict:
-    """List the LookML models the API credentials can access.
+    """List the LookML models the API credentials can access, WITH their explores.
 
-    Diagnostic helper for "cannot access data": if the model you expect is not
-    in this list, the Looker role assigned to the API credentials does not grant
-    access to it (fix it in Looker Admin, not in this code)."""
+    This is the entry point for schema discovery: it returns each accessible model
+    and the explores inside it, so you can pick a model+explore and then call
+    list_looker_fields. If a model you expect is missing, the Looker role on the
+    API credentials does not grant access to it (fix it in Looker Admin)."""
     sdk = looker_sdk.init40()
     try:
         models = sdk.all_lookml_models()
-        names = [m.name for m in models if getattr(m, "name", None)]
-        return {"status": "success", "models": names}
+        out = []
+        for m in models:
+            if not getattr(m, "name", None):
+                continue
+            explores = [e.name for e in (m.explores or []) if getattr(e, "name", None)]
+            out.append({"model": m.name, "explores": explores})
+        return {"status": "success", "models": out}
     except Exception as e:
         return {"status": "error", "message": f"Could not list models: {e}"}
+
+
+def list_looker_explores(model: str) -> dict:
+    """List the explores available inside a LookML model (so you can query them).
+
+    Use this when you know the model but not its explore names."""
+    sdk = looker_sdk.init40()
+    try:
+        m = sdk.lookml_model(lookml_model_name=model)
+        explores = [e.name for e in (m.explores or []) if getattr(e, "name", None)]
+        return {"status": "success", "model": model, "explores": explores}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not list explores for {model}: {e}"}
 
 
 def list_looker_fields(model: str, explore: str) -> dict:
@@ -568,6 +694,25 @@ def list_available_dashboards(search_term: str = "") -> dict:
         return {"status": "success", "dashboards": []}
     return {"status": "success",
             "dashboards": [{"id": str(d.id), "title": d.title} for d in dashboards]}
+
+
+def list_dashboard_filters(dashboard_id: str) -> dict:
+    """List a dashboard's filters so you know what you can filter on.
+
+    Returns each filter's name (use this as the key when passing filters),
+    title, type (date/number/string/field) and default value."""
+    sdk = looker_sdk.init40()
+    try:
+        dash = sdk.dashboard(dashboard_id=dashboard_id, fields="dashboard_filters")
+        out = []
+        for f in (dash.dashboard_filters or []):
+            out.append({
+                "name": f.name, "title": f.title,
+                "type": f.type, "default_value": f.default_value,
+            })
+        return {"status": "success", "filters": out}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not list dashboard filters: {e}"}
 
 
 # =============================================================================
@@ -596,6 +741,15 @@ root_agent = LlmAgent(
         'signed_url exactly as returned.\n\n'
         'IF THE USER ASKS ONLY FOR THE LINK: call the matching get_*_link tool '
         'directly and return the signed_url.\n\n'
+        'APPLYING DASHBOARD FILTERS: if the user asks for a filtered view (e.g. '
+        '"the sales dashboard for Brazil" or "last 30 days"), pass a "filters" '
+        'dict to show_dashboard_inline (and to get_dashboard_link so the link is '
+        'pre-filtered too). The dict is keyed by the dashboard\'s filter NAMES, '
+        'e.g. {"Country": "Brazil", "Order Created Date": "30 days"}. If you do '
+        'not know the exact filter names, call list_dashboard_filters(dashboard_id) '
+        'first. Filter values use Looker syntax (a value like "Brazil", a date '
+        'expression like "30 days" or "this month", a numeric expression like '
+        '">50"). This only applies to dashboards.\n\n'
         'CRITICAL LINK RULE: NEVER write, guess, or construct a Looker URL from '
         'your own knowledge. The ONLY acceptable link is the exact "signed_url" '
         'string returned by a get_dashboard_link / get_look_link / get_explore_link '
@@ -608,16 +762,24 @@ root_agent = LlmAgent(
         'and show the tool\'s exact "message" field verbatim so the cause can be '
         'diagnosed.\n\n'
         'TO ANSWER A DATA QUESTION (numbers, no chart):\n'
-        '- Use query_looker_data and summarize the rows in plain text or a small '
-        'markdown table.\n'
-        '- If you are unsure which model/explore/fields exist, call '
-        'list_looker_models, then list_looker_fields, before querying.\n'
+        'You CAN discover the full schema yourself - never tell the user you '
+        'cannot find the models or explores. Follow this chain:\n'
+        '1. call list_looker_models -> returns each accessible model WITH its '
+        'explores.\n'
+        '2. pick the relevant model and explore (use list_looker_explores(model) '
+        'if you need to re-list a single model\'s explores).\n'
+        '3. call list_looker_fields(model, explore) to get the exact field names.\n'
+        '4. call query_looker_data(model, explore, fields, ...) and summarize the '
+        'rows in plain text or a small markdown table. Data is queried live, so '
+        'the answer reflects current Looker data.\n'
+        'If the user asks about a topic that no accessible model covers (e.g. they '
+        'ask about water quality but only ecommerce models exist), say so plainly '
+        'and list what data IS available, instead of guessing.\n'
         '- If a data tool returns an access error, call list_looker_models and '
-        'tell the user plainly which models are accessible; the Looker role of '
-        'the API credentials may simply not grant access to the requested model.\n\n'
+        'tell the user which models are accessible; the Looker role of the API '
+        'credentials may not grant access to the requested model.\n\n'
         'When any tool returns status="error", relay the message plainly and '
         'suggest a concrete fix.\n\n'
-        'Hints when unsure: model="thelook", explore="order_items". '
         'vis_type options: looker_column, looker_bar, looker_line, looker_pie, looker_scatter.'
     ),
     planner=BuiltInPlanner(
@@ -632,8 +794,10 @@ root_agent = LlmAgent(
         get_explore_link,
         query_looker_data,
         list_looker_models,
+        list_looker_explores,
         list_looker_fields,
         list_available_dashboards,
+        list_dashboard_filters,
         load_artifacts_tool,   # displays the saved artifacts in the chat
     ],
 )
@@ -678,7 +842,23 @@ env_vars = {
     "LOOKERSDK_CLIENT_SECRET": os.environ["LOOKER_CLIENT_SECRET"],
     "LOOKERSDK_VERIFY_SSL": "true",
     "LOOKER_MODELS": os.environ.get("LOOKER_MODELS", '["thelook"]'),
+    # Reasoning model selection + Vertex routing for the Claude/LiteLlm path.
+    "AGENT_MODEL_PROVIDER": os.environ.get("AGENT_MODEL_PROVIDER", "gemini"),
+    "CLAUDE_MODEL": os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
+    "GEMINI_MODEL": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+    "VERTEXAI_PROJECT": PROJECT_ID,
+    "VERTEXAI_LOCATION": os.environ.get("CLAUDE_LOCATION", REGION),
+    "GOOGLE_GENAI_USE_VERTEXAI": "true",
+    # Used by the native Claude wrapper (AGENT_MODEL_PROVIDER="claude_native").
+    "GOOGLE_CLOUD_PROJECT": PROJECT_ID,
+    "GOOGLE_CLOUD_LOCATION": os.environ.get("CLAUDE_LOCATION", REGION),
 }
+
+# Pass the Anthropic API key only when using the direct Anthropic route
+# (AGENT_MODEL_PROVIDER="anthropic"). Export it before running the script:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+if os.environ.get("ANTHROPIC_API_KEY"):
+    env_vars["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_API_KEY"]
 
 try:
     remote_app = agent_engines.create(
@@ -690,7 +870,9 @@ try:
             "google-auth",
             "google-cloud-aiplatform[agent_engines,adk]",
             "requests",
-            # If you switch the model to Claude via LiteLlm, also add "litellm".
+            "litellm",   # for AGENT_MODEL_PROVIDER="claude" or "anthropic"
+            "anthropic[vertex]",   # for AGENT_MODEL_PROVIDER="claude_native"
+            # If a fresh dependency release breaks the deploy, pin versions here.
         ],
         extra_packages=["./looker_app"],
         service_account=AGENT_SA,
@@ -706,6 +888,7 @@ DEPLOYEOF
 # Export what deploy.py reads from the environment.
 export PROJECT_ID REGION BUCKET_NAME AGENT_SA
 export LOOKER_URL LOOKER_CLIENT_ID LOOKER_CLIENT_SECRET LOOKER_MODELS
+export AGENT_MODEL_PROVIDER CLAUDE_MODEL CLAUDE_LOCATION GEMINI_MODEL
 
 # The deploy is long, so run it in the background and print a heartbeat with the
 # latest log line every 15s. This keeps interactive terminals (e.g. Cloud Shell)
@@ -849,4 +1032,3 @@ echo "  1. Enable 'Embed SSO Authentication' (and Reset Secret)."
 echo "  2. Add the Gemini Enterprise domain to the embed allowlist."
 echo "  3. Make sure the API user's role can access the model(s) in LOOKER_MODELS,"
 echo "     otherwise data queries will return an access error."
-
