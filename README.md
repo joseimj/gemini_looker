@@ -4,7 +4,7 @@
 
 **A conversational Looker analytics agent for Google's Gemini Enterprise.**
 
-`gemini_looker.sh` is a single, idempotent script that stands up an end-to-end analytics agent: it provisions the cloud resources, deploys an [Agent Development Kit (ADK)](https://google.github.io/adk-docs/) agent to **Vertex AI Agent Engine**, and registers it in **Gemini Enterprise**. Once deployed, a business user can ask, in plain language, to *see* a dashboard, *get the numbers*, or *get an interactive link* — and the agent answers right inside the chat.
+`gemini_looker_v1.sh` is a single, idempotent script that stands up an end-to-end analytics agent: it provisions the cloud resources, deploys an [Agent Development Kit (ADK)](https://google.github.io/adk-docs/) agent to **Vertex AI Agent Engine**, and registers it in **Gemini Enterprise**. Once deployed, a business user can ask, in plain language, to *see* a dashboard, *get the numbers*, or *get an interactive link* — and the agent answers right inside the chat.
 
 **Author:** Jose Maldonado ([@joseimj](https://github.com/joseimj))
 
@@ -58,7 +58,7 @@ A user types a request in Gemini Enterprise and the agent responds in kind:
            ▼
 ┌──────────────────────────────────┐
 │  Vertex AI Agent Engine (ADK)      │   managed runtime hosting the agent
-│  - LlmAgent (Gemini, swappable)    │
+│  - LlmAgent (Claude/Gemini, swappable)    │
 │  - Render PNG -> ADK Artifacts     │
 │  - Signed links via Looker API     │
 │  - Dedicated service account       │
@@ -79,7 +79,7 @@ No Cloud Run, no message broker, no caching tier, no VPC. The agent talks to Loo
 - **Images are returned as ADK artifacts, not as text.** Each render tool saves the PNG as an artifact and the runtime displays it natively. The image bytes never pass through the model's text output — the only approach that renders reliably in Gemini Enterprise.
 - **No middle tier.** The agent calls Looker directly through its SDK. Fewer moving parts means fewer ways to fail, plus a cheaper and faster deployment.
 - **Signed links are minted by Looker, on demand.** Interactive URLs are created via the Looker `create_sso_embed_url` API (Looker signs them server-side), in a *separate* tool from rendering — so producing a link never blocks or delays the image.
-- **The reasoning model is swappable.** Defaults to Gemini; can be switched to Claude or another model without touching the rendering pipeline (see below).
+- **The reasoning model is swappable.** Defaults to Claude Sonnet on Vertex AI; can be switched to Gemini or the public Anthropic API with a single config variable, without touching the rendering pipeline (see below).
 
 ---
 
@@ -89,6 +89,7 @@ No Cloud Run, no message broker, no caching tier, no VPC. The agent talks to Loo
 - `gcloud` CLI, authenticated (`gcloud auth login`). Cloud Shell works out of the box.
 - A **Looker** instance with API credentials (Client ID and Client Secret).
 - **Embedding enabled** in Looker (Admin → Embed → *Embed SSO Authentication* + *Reset Secret*) for the interactive links.
+- For the default provider (`claude`): the **Claude model enabled in Vertex AI Model Garden** (the script verifies this in a preflight step).
 - A **Gemini Enterprise** app already created (you need its `AS_APP` ID).
 - A **GCS bucket** for deploy staging and image artifacts.
 - **Owner** (or equivalent) on the project.
@@ -98,13 +99,14 @@ No Cloud Run, no message broker, no caching tier, no VPC. The agent talks to Loo
 
 ## Configuration
 
-Edit the variables at the top of `gemini_looker.sh` before running:
+Edit the variables at the top of `gemini_looker_v1.sh` before running:
 
 ```bash
 PROJECT_ID="your-gcp-project"
 PROJECT_NUMBER="123456789012"
 REGION="us-central1"
 BUCKET_NAME="your-staging-bucket"
+BUCKET_LOCATION="US"
 
 # Looker
 LOOKER_URL="https://your-instance.looker.com"
@@ -115,7 +117,15 @@ LOOKER_MODELS='["thelook"]'   # LookML model(s) the agent may use
 
 # Gemini Enterprise
 AS_APP="your-agent-id"
-ENGINE_LOCATION="us"
+ENGINE_LOCATION="us"           # "us", "eu" or "global"
+AGENT_DISPLAY_NAME="Looker Agent"
+AGENT_DESCRIPTION="Looker agent that renders dashboards as inline images and answers data questions."
+
+# Reasoning model (see section below)
+AGENT_MODEL_PROVIDER="claude"  # "claude", "claude_native", "anthropic" or "gemini"
+CLAUDE_MODEL="claude-sonnet-4-6"
+CLAUDE_LOCATION="us-east5"     # Vertex region that serves Claude
+GEMINI_MODEL="gemini-2.5-flash"
 ```
 
 Step `-1` refuses to run while any value still starts with `YOUR_`.
@@ -128,9 +138,9 @@ Step `-1` refuses to run while any value still starts with `YOUR_`.
 git clone https://github.com/joseimj/gemini_looker.git
 cd gemini_looker
 
-chmod +x gemini_looker.sh
+chmod +x gemini_looker_v1.sh
 # edit the configuration block, then:
-./gemini_looker.sh
+./gemini_looker_v1.sh
 ```
 
 The script runs, in order:
@@ -138,11 +148,13 @@ The script runs, in order:
 1. Validate configuration
 2. Authenticate
 3. Enable required APIs (IAM, Vertex AI, Discovery Engine, Looker, Storage, Resource Manager)
-4. Create the agent service account and grant minimal IAM
-5. Create the staging bucket (deploy + artifacts)
-6. Build the agent application (ADK)
-7. Deploy the agent to Agent Engine *(~15–20 min)*
-8. Register the agent in Gemini Enterprise
+4. Preflight: verify the chosen Claude model is enabled in Model Garden (skipped for `gemini`/`anthropic`)
+5. Create the agent service account and grant minimal IAM
+6. Create the staging bucket (deploy + artifacts)
+7. Prepare an isolated Python environment
+8. Build the agent application (ADK)
+9. Deploy the agent to Agent Engine *(~15–20 min)*
+10. Register the agent in Gemini Enterprise
 
 > The deploy prints a heartbeat every 15s. In Cloud Shell, keep the tab active during the deploy (idle timeout is ~20 min).
 
@@ -154,43 +166,42 @@ All capabilities call Looker directly through its SDK.
 
 **Show images (rendered inline via artifacts):**
 
-- `show_dashboard_inline` — render a dashboard as a PNG
+- `show_dashboard_inline` — render a dashboard as a PNG, optionally pre-filtered via `filters`
 - `show_look_inline` — render a saved Look as a PNG
 - `show_query_inline` — run an ad-hoc query and render it as a chart (`looker_column`, `looker_bar`, `looker_line`, `looker_pie`, `looker_scatter`)
 
 **Interactive links (signed by Looker, on demand):**
 
-- `get_dashboard_link`, `get_look_link`, `get_explore_link` — return a signed SSO embed URL
+- `get_dashboard_link`, `get_look_link`, `get_explore_link` — return a signed SSO embed URL (`get_dashboard_link` accepts optional `filters`)
 
 **Data (text/table answers):**
 
 - `query_looker_data` — run a query and return rows
 - `list_looker_models` — list the models the API credentials can reach (data-access diagnostics)
+- `list_looker_explores` — list a model's explores
 - `list_looker_fields` — list an explore's dimensions and measures
 - `list_available_dashboards` — find dashboards by title
+- `list_dashboard_filters` — list a dashboard's filters (names and values)
 
 ---
 
 ## Swapping the reasoning model
 
-The reasoning model is independent of rendering, so you can change it freely **without losing the image feature**. The default is Gemini:
+The model is chosen with configuration variables — no code edits needed. `litellm` and `anthropic[vertex]` are already included in the deploy requirements.
 
-```python
-AGENT_MODEL = "gemini-2.5-flash"
+```bash
+AGENT_MODEL_PROVIDER="claude"    # "claude", "claude_native", "anthropic" or "gemini"
+CLAUDE_MODEL="claude-sonnet-4-6"
+CLAUDE_LOCATION="us-east5"
+GEMINI_MODEL="gemini-2.5-flash"
 ```
 
-To drive the agent with **Anthropic Claude (e.g. Sonnet 4.6)** instead:
+- **`claude`** *(default)* — Claude on Vertex AI via LiteLLM. No API key; billed through GCP. Enable the model in **Vertex AI Model Garden** and set `CLAUDE_LOCATION` to a region that serves it (the script verifies this in a preflight step).
+- **`claude_native`** — Claude on Vertex AI via the ADK's native wrapper (a different code path than LiteLLM; try it if streaming works but Gemini Enterprise returns empty responses).
+- **`anthropic`** — Claude via the public Anthropic API; requires `ANTHROPIC_API_KEY`.
+- **`gemini`** — Gemini on Vertex AI (`GEMINI_MODEL`).
 
-1. Enable the model in **Vertex AI Model Garden** (`publishers/anthropic/model-garden/claude-sonnet-4-6`).
-2. Add `litellm` to the `requirements` list in `deploy.py`.
-3. Replace the model line in `looker_app/agent.py`:
-
-```python
-from google.adk.models.lite_llm import LiteLlm
-AGENT_MODEL = LiteLlm(model="vertex_ai/claude-sonnet-4-6")
-```
-
-(For the public Anthropic API instead of Vertex, use `LiteLlm(model="anthropic/claude-sonnet-4-6")` with `ANTHROPIC_API_KEY` set.)
+The reasoning model is independent of rendering, so switching providers never affects the image feature.
 
 ---
 
@@ -206,7 +217,7 @@ If a data query returns an access error ("cannot access data"), the cause is alm
 
 **Data queries fail with an access error.** See [A note on data access](#a-note-on-data-access). Run `list_looker_models` to confirm what the API user can reach.
 
-**Deploy fails with a 500 ("revision not ready").** This is a catch-all for a container that didn't start. Check **Logs Explorer → resource type "Vertex AI Reasoning Engine"** for the real error. The most common cause is a freshly upgraded dependency: pin exact versions in both Step 4 and `deploy.py` so the build and runtime match.
+**Deploy fails with a 500 ("revision not ready").** This is a catch-all for a container that didn't start. Check **Logs Explorer → resource type "Vertex AI Reasoning Engine"** for the real error. The most common cause is a freshly upgraded dependency: pin exact versions in both the `pip install` (Python environment step) and `deploy.py`'s requirements so the build and runtime match.
 
 **Dashboard render times out.** Heavy dashboards can be slow; the render task is capped at 90s. Try a Look or an ad-hoc query (faster), or raise the cap in `show_dashboard_inline`.
 

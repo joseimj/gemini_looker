@@ -4,7 +4,7 @@
 
 **Um agente conversacional de analytics do Looker para o Gemini Enterprise do Google.**
 
-`gemini_looker.sh` é um único script idempotente que monta um agente de analytics de ponta a ponta: provisiona os recursos de nuvem, faz o deploy de um agente do [Agent Development Kit (ADK)](https://google.github.io/adk-docs/) no **Vertex AI Agent Engine** e o registra no **Gemini Enterprise**. Depois do deploy, um usuário de negócio pode pedir, em linguagem natural, para *ver* um dashboard, *obter os números* ou *obter um link interativo* — e o agente responde diretamente no chat.
+`gemini_looker_v1.sh` é um único script idempotente que monta um agente de analytics de ponta a ponta: provisiona os recursos de nuvem, faz o deploy de um agente do [Agent Development Kit (ADK)](https://google.github.io/adk-docs/) no **Vertex AI Agent Engine** e o registra no **Gemini Enterprise**. Depois do deploy, um usuário de negócio pode pedir, em linguagem natural, para *ver* um dashboard, *obter os números* ou *obter um link interativo* — e o agente responde diretamente no chat.
 
 **Autor:** Jose Maldonado ([@joseimj](https://github.com/joseimj))
 
@@ -58,7 +58,7 @@ O usuário digita um pedido no Gemini Enterprise e o agente responde de acordo:
            ▼
 ┌──────────────────────────────────┐
 │  Vertex AI Agent Engine (ADK)      │   runtime gerenciado que hospeda o agente
-│  - LlmAgent (Gemini, substituível) │
+│  - LlmAgent (Claude/Gemini, substituível) │
 │  - Render PNG -> ADK Artifacts     │
 │  - Links assinados via Looker API  │
 │  - Service account dedicada        │
@@ -79,7 +79,7 @@ Sem Cloud Run, sem message broker, sem camada de cache, sem VPC. O agente fala d
 - **As imagens são retornadas como artifacts do ADK, não como texto.** Cada ferramenta de renderização salva o PNG como artifact e o runtime o exibe nativamente. Os bytes da imagem nunca passam pela saída de texto do modelo — a única abordagem que renderiza de forma confiável no Gemini Enterprise.
 - **Sem camada intermediária.** O agente chama o Looker diretamente pelo SDK. Menos peças móveis significa menos formas de falhar, além de um deploy mais barato e rápido.
 - **Os links assinados são gerados pelo Looker, sob demanda.** As URLs interativas são criadas pela API `create_sso_embed_url` do Looker (o Looker as assina no lado do servidor), em uma ferramenta *separada* da renderização — assim, produzir um link nunca bloqueia nem atrasa a imagem.
-- **O modelo de raciocínio é substituível.** O padrão é o Gemini; pode ser trocado pelo Claude ou outro modelo sem mexer no pipeline de renderização (veja abaixo).
+- **O modelo de raciocínio é substituível.** O padrão é o Claude Sonnet no Vertex AI; pode ser trocado pelo Gemini ou pela API pública da Anthropic com uma única variável de configuração, sem mexer no pipeline de renderização (veja abaixo).
 
 ---
 
@@ -89,6 +89,7 @@ Sem Cloud Run, sem message broker, sem camada de cache, sem VPC. O agente fala d
 - CLI `gcloud` autenticada (`gcloud auth login`). O Cloud Shell funciona sem configuração adicional.
 - Uma instância do **Looker** com credenciais de API (Client ID e Client Secret).
 - **Embedding habilitado** no Looker (Admin → Embed → *Embed SSO Authentication* + *Reset Secret*) para os links interativos.
+- Para o provedor padrão (`claude`): o **modelo Claude habilitado no Vertex AI Model Garden** (o script verifica isso em um passo de preflight).
 - Um app do **Gemini Enterprise** já criado (você precisa do ID `AS_APP`).
 - Um **bucket do GCS** para o staging do deploy e os artifacts de imagens.
 - Papel de **Owner** (ou equivalente) no projeto.
@@ -98,13 +99,14 @@ Sem Cloud Run, sem message broker, sem camada de cache, sem VPC. O agente fala d
 
 ## Configuração
 
-Edite as variáveis no topo de `gemini_looker.sh` antes de executar:
+Edite as variáveis no topo de `gemini_looker_v1.sh` antes de executar:
 
 ```bash
 PROJECT_ID="your-gcp-project"
 PROJECT_NUMBER="123456789012"
 REGION="us-central1"
 BUCKET_NAME="your-staging-bucket"
+BUCKET_LOCATION="US"
 
 # Looker
 LOOKER_URL="https://your-instance.looker.com"
@@ -115,7 +117,15 @@ LOOKER_MODELS='["thelook"]'   # modelo(s) LookML que o agente pode usar
 
 # Gemini Enterprise
 AS_APP="your-agent-id"
-ENGINE_LOCATION="us"
+ENGINE_LOCATION="us"           # "us", "eu" ou "global"
+AGENT_DISPLAY_NAME="Looker Agent"
+AGENT_DESCRIPTION="Agente do Looker que renderiza dashboards como imagens inline e responde perguntas de dados."
+
+# Modelo de raciocínio (veja a seção abaixo)
+AGENT_MODEL_PROVIDER="claude"  # "claude", "claude_native", "anthropic" ou "gemini"
+CLAUDE_MODEL="claude-sonnet-4-6"
+CLAUDE_LOCATION="us-east5"     # região do Vertex que serve Claude
+GEMINI_MODEL="gemini-2.5-flash"
 ```
 
 O passo `-1` se recusa a executar enquanto algum valor ainda começar com `YOUR_`.
@@ -128,9 +138,9 @@ O passo `-1` se recusa a executar enquanto algum valor ainda começar com `YOUR_
 git clone https://github.com/joseimj/gemini_looker.git
 cd gemini_looker
 
-chmod +x gemini_looker.sh
+chmod +x gemini_looker_v1.sh
 # edite o bloco de configuração e então:
-./gemini_looker.sh
+./gemini_looker_v1.sh
 ```
 
 O script executa, nesta ordem:
@@ -138,11 +148,13 @@ O script executa, nesta ordem:
 1. Validar a configuração
 2. Autenticar
 3. Habilitar as APIs necessárias (IAM, Vertex AI, Discovery Engine, Looker, Storage, Resource Manager)
-4. Criar a service account do agente e conceder IAM mínimo
-5. Criar o bucket de staging (deploy + artifacts)
-6. Construir a aplicação do agente (ADK)
-7. Fazer o deploy do agente no Agent Engine *(~15–20 min)*
-8. Registrar o agente no Gemini Enterprise
+4. Preflight: verificar se o modelo Claude escolhido está habilitado no Model Garden (pulado para `gemini`/`anthropic`)
+5. Criar a service account do agente e conceder IAM mínimo
+6. Criar o bucket de staging (deploy + artifacts)
+7. Preparar um ambiente Python isolado
+8. Construir a aplicação do agente (ADK)
+9. Fazer o deploy do agente no Agent Engine *(~15–20 min)*
+10. Registrar o agente no Gemini Enterprise
 
 > O deploy imprime um heartbeat a cada 15 s. No Cloud Shell, mantenha a aba ativa durante o deploy (o timeout de inatividade é de ~20 min).
 
@@ -154,43 +166,42 @@ Todas as capacidades chamam o Looker diretamente pelo SDK.
 
 **Mostrar imagens (renderizadas inline via artifacts):**
 
-- `show_dashboard_inline` — renderiza um dashboard como PNG
+- `show_dashboard_inline` — renderiza um dashboard como PNG, opcionalmente pré-filtrado via `filters`
 - `show_look_inline` — renderiza um Look salvo como PNG
 - `show_query_inline` — executa uma consulta ad hoc e a renderiza como gráfico (`looker_column`, `looker_bar`, `looker_line`, `looker_pie`, `looker_scatter`)
 
 **Links interativos (assinados pelo Looker, sob demanda):**
 
-- `get_dashboard_link`, `get_look_link`, `get_explore_link` — retornam uma URL de embed SSO assinada
+- `get_dashboard_link`, `get_look_link`, `get_explore_link` — retornam uma URL de embed SSO assinada (`get_dashboard_link` aceita `filters` opcionais)
 
 **Dados (respostas em texto/tabela):**
 
 - `query_looker_data` — executa uma consulta e retorna linhas
 - `list_looker_models` — lista os modelos que as credenciais de API podem acessar (diagnóstico de acesso a dados)
+- `list_looker_explores` — lista os explores de um modelo
 - `list_looker_fields` — lista as dimensões e medidas de um explore
 - `list_available_dashboards` — encontra dashboards pelo título
+- `list_dashboard_filters` — lista os filtros de um dashboard (nomes e valores)
 
 ---
 
 ## Trocando o modelo de raciocínio
 
-O modelo de raciocínio é independente da renderização, então você pode trocá-lo livremente **sem perder o recurso de imagens**. O padrão é o Gemini:
+O modelo é escolhido com variáveis de configuração — sem editar código. `litellm` e `anthropic[vertex]` já estão incluídos nos requirements do deploy.
 
-```python
-AGENT_MODEL = "gemini-2.5-flash"
+```bash
+AGENT_MODEL_PROVIDER="claude"    # "claude", "claude_native", "anthropic" or "gemini"
+CLAUDE_MODEL="claude-sonnet-4-6"
+CLAUDE_LOCATION="us-east5"
+GEMINI_MODEL="gemini-2.5-flash"
 ```
 
-Para usar o **Anthropic Claude (p. ex. Sonnet 4.6)** no lugar:
+- **`claude`** *(padrão)* — Claude no Vertex AI via LiteLLM. Sem API key; cobrado via GCP. Habilite o modelo no **Vertex AI Model Garden** e defina `CLAUDE_LOCATION` para uma região que o sirva (o script verifica isso em um passo de preflight).
+- **`claude_native`** — Claude no Vertex AI via o wrapper nativo do ADK (um caminho de código diferente do LiteLLM; tente se o streaming funciona mas o Gemini Enterprise retorna respostas vazias).
+- **`anthropic`** — Claude via a API pública da Anthropic; requer `ANTHROPIC_API_KEY`.
+- **`gemini`** — Gemini no Vertex AI (`GEMINI_MODEL`).
 
-1. Habilite o modelo no **Vertex AI Model Garden** (`publishers/anthropic/model-garden/claude-sonnet-4-6`).
-2. Adicione `litellm` à lista `requirements` em `deploy.py`.
-3. Substitua a linha do modelo em `looker_app/agent.py`:
-
-```python
-from google.adk.models.lite_llm import LiteLlm
-AGENT_MODEL = LiteLlm(model="vertex_ai/claude-sonnet-4-6")
-```
-
-(Para a API pública da Anthropic em vez do Vertex, use `LiteLlm(model="anthropic/claude-sonnet-4-6")` com `ANTHROPIC_API_KEY` definida.)
+O modelo de raciocínio é independente da renderização, então trocar de provedor nunca afeta o recurso de imagens.
 
 ---
 
@@ -206,7 +217,7 @@ Se uma consulta de dados retornar um erro de acesso ("cannot access data"), a ca
 
 **Consultas de dados falham com erro de acesso.** Veja [Uma nota sobre acesso a dados](#uma-nota-sobre-acesso-a-dados). Execute `list_looker_models` para confirmar o que o usuário de API pode acessar.
 
-**O deploy falha com um 500 ("revision not ready").** É um erro genérico de um contêiner que não iniciou. Verifique **Logs Explorer → tipo de recurso "Vertex AI Reasoning Engine"** para ver o erro real. A causa mais comum é uma dependência recém-atualizada: fixe versões exatas tanto no Passo 4 quanto em `deploy.py` para que o build e o runtime coincidam.
+**O deploy falha com um 500 ("revision not ready").** É um erro genérico de um contêiner que não iniciou. Verifique **Logs Explorer → tipo de recurso "Vertex AI Reasoning Engine"** para ver o erro real. A causa mais comum é uma dependência recém-atualizada: fixe versões exatas tanto no `pip install` (passo do ambiente Python) quanto nos requirements de `deploy.py` para que o build e o runtime coincidam.
 
 **A renderização do dashboard estoura o timeout.** Dashboards pesados podem ser lentos; a tarefa de render é limitada a 90 s. Tente um Look ou uma consulta ad hoc (mais rápidos), ou aumente o limite em `show_dashboard_inline`.
 
